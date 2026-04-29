@@ -79,4 +79,4 @@ def fetch_repositories_sorted_by_stars(token, languages=['C++', 'C'], per_page=1
     print(f"Results saved to {filename}")
 
 if __name__ == "__main__":
-    fetch_repositories_sorted_by_stars(token='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')
+    fetch_repositories_sorted_by_stars(token='')
