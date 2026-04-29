@@ -1,0 +1,15 @@
+project/8cc
+project/mold
+project/simdjson
+project/raylib
+project/entt
+project/flameshot
+project/rnnoise
+project/crow
+project/libfacedetection
+project/guetzli
+project/libjpeg-turbo
+project/aubio
+project/oatpp
+project/geany
+project/polybar
