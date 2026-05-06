@@ -1,7 +1,24 @@
+# src/cxxcrafter/agents/__init__.py
 from .base_agent import BaseAgent
-from .dependency_agent import DependencyAgent
-from .build_agent import BuildAgent
-from .error_agent import ErrorAgent
-from .coordinator import AgentCoordinator
+from .dependency_agent import DependencyAgent, DependencyAnalysis
+from .build_agent import BuildAgent, BuildPlan
+from .error_agent import ErrorAgent, FailureAnalysis
+from .dockerfile_repair_agent import DockerfileRepairAgent, RepairPatch
+from .coordinator import CXXCrafterCoordinator
 
-__all__ = ["BaseAgent", "DependencyAgent", "BuildAgent", "ErrorAgent", "AgentCoordinator"]
+# 兼容旧代码
+AgentCoordinator = CXXCrafterCoordinator
+
+__all__ = [
+    "BaseAgent",
+    "DependencyAgent",
+    "DependencyAnalysis",
+    "BuildAgent",
+    "BuildPlan",
+    "ErrorAgent",
+    "FailureAnalysis",
+    "DockerfileRepairAgent",
+    "RepairPatch",
+    "CXXCrafterCoordinator",
+    "AgentCoordinator",
+]

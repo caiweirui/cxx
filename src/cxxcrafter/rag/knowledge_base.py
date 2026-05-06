@@ -1,84 +1,143 @@
 import os
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
-from typing import List, Dict
 import json
+from typing import List, Dict
+
+import numpy as np
+
+try:
+    import faiss
+except Exception:
+    faiss = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
 
 class KnowledgeBase:
     def __init__(self, base_path: str = "./data/knowledge_base"):
         self.base_path = os.path.abspath(base_path)
         os.makedirs(self.base_path, exist_ok=True)
-        
-        # 本地嵌入模型（无需API）
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
-        
-        # FAISS索引文件路径
+
         self.index_path = os.path.join(self.base_path, "faiss_index.bin")
         self.metadata_path = os.path.join(self.base_path, "metadata.json")
-        
-        # 初始化或加载索引
-        self.dimension = 384  # all-MiniLM-L6-v2的维度
+        self.dimension = 384
+
+        self.model = None
+        if SentenceTransformer is not None:
+            try:
+                self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception:
+                self.model = None
+
         self.index = None
-        self.metadata = []
+        self.metadata: List[Dict] = []
         self._load_or_create()
 
     def _load_or_create(self):
+        if faiss is None:
+            self.index = None
+            self.metadata = self._load_metadata()
+            return
+
         if os.path.exists(self.index_path) and os.path.exists(self.metadata_path):
-            self.index = faiss.read_index(self.index_path)
-            with open(self.metadata_path, 'r', encoding='utf-8') as f:
-                self.metadata = json.load(f)
-        else:
-            self.index = faiss.IndexFlatL2(self.dimension)
+            try:
+                self.index = faiss.read_index(self.index_path)
+                self.metadata = self._load_metadata()
+                return
+            except Exception:
+                pass
+
+        self.index = faiss.IndexFlatL2(self.dimension)
+        self.metadata = []
+
+    def _load_metadata(self) -> List[Dict]:
+        if not os.path.exists(self.metadata_path):
+            return []
+        try:
+            with open(self.metadata_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
 
     def _save(self):
-        faiss.write_index(self.index, self.index_path)
-        with open(self.metadata_path, 'w', encoding='utf-8') as f:
+        if faiss is not None and self.index is not None:
+            try:
+                faiss.write_index(self.index, self.index_path)
+            except Exception:
+                pass
+        with open(self.metadata_path, "w", encoding="utf-8") as f:
             json.dump(self.metadata, f, ensure_ascii=False, indent=2)
 
+    def _embed(self, text: str) -> np.ndarray:
+        text = text or ""
+        if self.model is not None:
+            try:
+                vec = self.model.encode([text])[0].astype("float32")
+                return vec
+            except Exception:
+                pass
+
+        import hashlib
+        vec = np.zeros(self.dimension, dtype="float32")
+        digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
+        for i, b in enumerate(digest):
+            vec[i % self.dimension] += float(b) / 255.0
+        return vec
+
     def add_error_case(self, error_id: str, error_msg: str, solution: str, project: str):
-        """添加构建错误案例到知识库"""
-        # 向量化
-        embedding = self.model.encode([error_msg])[0].astype('float32')
-        
-        # 添加到FAISS
-        self.index.add(np.array([embedding]))
-        
-        # 保存元数据
+        embedding = self._embed(error_msg)
+        if faiss is not None and self.index is not None:
+            self.index.add(np.array([embedding], dtype="float32"))
+
         self.metadata.append({
             "id": error_id,
             "error": error_msg,
             "solution": solution,
-            "project": project
+            "project": project,
         })
-        
         self._save()
-        print(f"✅ 案例已添加到知识库 (ID: {error_id})")
 
     def query_similar_errors(self, error_msg: str, top_k: int = 3) -> List[Dict]:
-        """检索相似错误案例"""
-        if self.index.ntotal == 0:
+        if not self.metadata:
             return []
-        
-        # 向量化查询
-        embedding = self.model.encode([error_msg])[0].astype('float32')
-        
-        # FAISS检索
-        distances, indices = self.index.search(np.array([embedding]), top_k)
-        
-        # 格式化结果
+
+        if faiss is None or self.index is None or self.index.ntotal == 0:
+            target = error_msg.lower()
+            scored = []
+            for item in self.metadata:
+                err = item.get("error", "").lower()
+                score = 0
+                for token in target.split()[:20]:
+                    if token and token in err:
+                        score += 1
+                scored.append((score, item))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            result = []
+            for score, item in scored[:top_k]:
+                result.append({
+                    "id": item["id"],
+                    "error": item["error"],
+                    "solution": item["solution"],
+                    "project": item["project"],
+                    "distance": float(max(0, 10 - score)),
+                })
+            return result
+
+        embedding = self._embed(error_msg)
+        distances, indices = self.index.search(np.array([embedding], dtype="float32"), top_k)
         cases = []
         for i, idx in enumerate(indices[0]):
-            if idx < len(self.metadata):
+            if 0 <= idx < len(self.metadata):
+                item = self.metadata[idx]
                 cases.append({
-                    "id": self.metadata[idx]["id"],
-                    "error": self.metadata[idx]["error"],
-                    "solution": self.metadata[idx]["solution"],
-                    "project": self.metadata[idx]["project"],
-                    "distance": float(distances[0][i])
+                    "id": item["id"],
+                    "error": item["error"],
+                    "solution": item["solution"],
+                    "project": item["project"],
+                    "distance": float(distances[0][i]),
                 })
         return cases
 
     def get_all_cases(self) -> int:
-        """获取知识库总案例数"""
-        return self.index.ntotal
+        return len(self.metadata)

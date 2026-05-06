@@ -1,88 +1,69 @@
 import os
-import shutil
-from typing import Optional
-from cxxcrafter.config import CXXCrafterConfig
+from typing import Any, Dict, Optional, Union
+
+try:
+    from .dockerfile_generator import DockerfileGenerator
+    from ..parser import parse_project
+except ImportError:
+    from cxxcrafter.generation_module.dockerfile_generator import DockerfileGenerator
+    from cxxcrafter.parser import parse_project
+
+def _is_parsed_project(obj: Any) -> bool:
+    """
+    粗略判断是否已经是 parse_project 的结果。
+    """
+    return isinstance(obj, dict) and "project_path" in obj
 
 def generate_dockerfile(
-    project_path, 
-    playground_path, 
-    build_system, 
-    deps, 
-    docs, 
-    project_name,
-    config: Optional[CXXCrafterConfig] = None
-):
-    """生成Dockerfile的核心函数（Windows权限修复版）"""
-    # 创建工作目录
-    target_dir = playground_path
-    os.makedirs(target_dir, exist_ok=True)
-    
-    # 复制项目文件（跳过 .git 目录，避免Windows权限问题）
-    dest_project = os.path.join(target_dir, "project")
-    
-    # ===================== 修复点1：跨平台安全删除旧目录 =====================
-    if os.path.exists(dest_project):
-        try:
-            # 跨平台：尝试正常删除
-            shutil.rmtree(dest_project, ignore_errors=False)
-        except PermissionError:
-            # Ubuntu/Windows权限问题：强制删除
-            try:
-                import stat
-                # 递归修改权限为可写
-                for root, dirs, files in os.walk(dest_project):
-                    for d in dirs:
-                        os.chmod(os.path.join(root, d), stat.S_IRWXU)
-                    for f in files:
-                        os.chmod(os.path.join(root, f), stat.S_IRWXU)
-                shutil.rmtree(dest_project, ignore_errors=True)
-            except:
-                # 最后兜底：重命名
-                try:
-                    old_dir = dest_project + ".old"
-                    if os.path.exists(old_dir):
-                        shutil.rmtree(old_dir, ignore_errors=True)
-                    os.rename(dest_project, old_dir)
-                except:
-                    pass
-    # ===================================================================
-    # ===================================================================
-    
-    # ===================== 修复点2：复制时跳过 .git 目录 =====================
-    def ignore_git(dir, files):
-        return ['.git'] if '.git' in files else []
-    
-    shutil.copytree(
-        project_path, 
-        dest_project, 
-        ignore=ignore_git,  # 关键：跳过 .git 目录
-        symlinks=True,
-        dirs_exist_ok=True
-    )
-    # ===================================================================
-    
-    # 构建提示词
-    prompt = f"""
-    你是C/C++项目构建专家，生成Ubuntu环境的Dockerfile。
-    项目构建系统：{build_system}
-    依赖：{deps}
-    构建说明：{docs}
-    只返回纯净的Dockerfile代码，无多余文字。
+    project_or_parsed: Union[str, Dict[str, Any]],
+    config: Any = None,
+    base_image: str = "ubuntu:22.04",
+    agent_result: Optional[Dict[str, Any]] = None,
+    output_path: Optional[str] = None,
+    compatibility_mode: bool = True,
+) -> str:
     """
-    
-    # 调用模型生成（使用传入的config）
-    from cxxcrafter.llm.bot import GPTBot
-    
-    if config:
-        bot = GPTBot(system_prompt="你是专业的Dockerfile生成助手", config=config)
+    兼容式 Dockerfile 生成入口。
+
+    参数：
+        project_or_parsed:
+            - 如果是 str/path，则作为项目路径，会自动 parse_project()
+            - 如果是 dict，则视为 parse_project() 的结果
+        config:
+            CXXCrafterConfig 或兼容对象
+        base_image:
+            基础镜像
+        agent_result:
+            多智能体运行结果
+        output_path:
+            如果提供，则会把生成结果写入该路径
+        compatibility_mode:
+            传给 parse_project 的兼容模式
+
+    返回：
+        生成的 Dockerfile 文本
+    """
+    if _is_parsed_project(project_or_parsed):
+        parsed_project = project_or_parsed
     else:
-        bot = GPTBot(system_prompt="你是专业的Dockerfile生成助手")
-    
-    dockerfile_content = bot.inference(prompt)
-    
-    # 写入Dockerfile
-    dockerfile_path = os.path.join(target_dir, "Dockerfile")
-    with open(dockerfile_path, "w", encoding="utf-8") as f:
-        f.write(dockerfile_content)
-    
-    print(f"✅ {project_name} Dockerfile 生成完成：{dockerfile_path}")
+        project_path = os.path.abspath(str(project_or_parsed))
+        parsed_project = parse_project(
+            project_path,
+            compatibility_mode=compatibility_mode,
+        )
+
+    generator = DockerfileGenerator(
+        parsed_project=parsed_project,
+        base_image=base_image,
+        config=config,
+        agent_result=agent_result,
+    )
+
+    dockerfile_content = generator.generate()
+
+    if output_path:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(dockerfile_content)
+
+    return dockerfile_content

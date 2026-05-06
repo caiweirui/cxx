@@ -1,22 +1,15 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# CXXCrafter Ubuntu启动脚本
-echo "=========================================="
-echo "CXXCrafter 可视化软件 - Ubuntu"
-echo "=========================================="
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
 
-# 检查虚拟环境
-if [ ! -d ".venv" ]; then
-    echo "❌ 虚拟环境不存在，请先运行安装脚本！"
-    exit 1
+if [ -d ".venv" ]; then
+  # shellcheck disable=SC1091
+  source ".venv/bin/activate"
 fi
 
-# 激活虚拟环境
-echo "✅ 激活虚拟环境..."
-source .venv/bin/activate
+export PYTHONUTF8=1
+export PYTHONIOENCODING="utf-8"
 
-# 启动GUI
-echo "🚀 启动软件..."
-python src/cxxcrafter/gui/main.py
-
-echo "✅ 软件已退出"
+python3 -m cxxcrafter.gui.main "$@"

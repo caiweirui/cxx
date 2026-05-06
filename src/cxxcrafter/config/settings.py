@@ -36,49 +36,174 @@ RECOMMENDED_MODELS = {
     "dependency": "gpt-5.4-mini",
     "build": "gpt-5.4-nano",
     "error": "gpt-5.4-pro",
-    "coordinator": "gpt-5.4-mini"
+    "coordinator": "gpt-5.4-mini",
+    "dockerfile_repair": "gpt-5.4-pro",
 }
 
 class AgentConfig:
     """单个智能体的配置"""
+
     def __init__(self, model: str = "gpt-5.4-nano"):
         self.model: str = model
-        self.api_key: Optional[str] = None  # 独立API Key（可选）
-        self.base_url: Optional[str] = None  # 独立Base URL（可选）
+        self.api_key: Optional[str] = None
+        self.base_url: Optional[str] = None
 
     def is_independent(self) -> bool:
         """是否使用独立配置"""
         return self.api_key is not None and len(self.api_key) > 0
 
 class CXXCrafterConfig:
+    """
+    CXXCrafter 全局配置
+
+    新增内容：
+    - enable_build_cache: 是否启用“Dockerfile 不变则复用上次成功结果”
+    - skip_rebuild_if_unchanged: 是否在 Dockerfile 未变化时跳过重复构建
+    - use_buildkit: 是否启用 BuildKit
+    - buildkit_progress_plain: 是否使用 plain 输出，便于日志查看
+    - dockerfile_repair_model: Dockerfile 修复智能体模型
+    - dockerfile_repair_api_key: Dockerfile 修复智能体独立 API Key
+    - dockerfile_repair_base_url: Dockerfile 修复智能体独立 Base URL
+    """
+
     def __init__(self):
-        # 全局配置（兜底）
+        # ===== 兼容旧代码的别名字段 =====
+        self.api_key: Optional[str] = None
+        self.base_url: str = "https://api.jiekou.ai/openai"
+
+        # ===== 全局配置（兜底） =====
         self.global_api_key: Optional[str] = None
         self.global_base_url: str = "https://api.jiekou.ai/openai"
-        
-        # 每个智能体的独立配置
+
+        # ===== 构建/验证相关开关 =====
+        self.enable_build_cache: bool = True
+        self.skip_rebuild_if_unchanged: bool = True
+        self.use_buildkit: bool = True
+        self.buildkit_progress_plain: bool = True
+
+        # ===== 运行行为 =====
+        self.max_rounds: int = 2
+        self.enable_iterative_repair: bool = True
+        self.compatibility_mode: bool = True
+
+        # ===== 缓存/日志目录 =====
+        self.cache_dir: str = "./data/cache"
+        self.logs_dir: str = "./data/build_logs"
+        self.output_root: str = "./dockerfile_playground"
+
+        # ===== 默认基础镜像 =====
+        self.base_image: str = "ubuntu:22.04"
+
+        # ===== 每个智能体的独立配置 =====
         self.agent_configs: Dict[str, AgentConfig] = {
             "dependency": AgentConfig(RECOMMENDED_MODELS["dependency"]),
             "build": AgentConfig(RECOMMENDED_MODELS["build"]),
             "error": AgentConfig(RECOMMENDED_MODELS["error"]),
-            "coordinator": AgentConfig(RECOMMENDED_MODELS["coordinator"])
+            "coordinator": AgentConfig(RECOMMENDED_MODELS["coordinator"]),
+            "dockerfile_repair": AgentConfig(RECOMMENDED_MODELS["dockerfile_repair"]),
         }
 
+        # ===== Dockerfile 修复智能体的直观字段 =====
+        self.dockerfile_repair_model: str = RECOMMENDED_MODELS["dockerfile_repair"]
+        self.dockerfile_repair_api_key: Optional[str] = None
+        self.dockerfile_repair_base_url: Optional[str] = None
+
+        # 尽量从环境变量载入
+        self.load_from_env()
+
+        # 同步一次，避免环境变量只写了全局但 repair 侧读取不到
+        self._sync_dockerfile_repair_aliases()
+
+    # ------------------------------------------------------------------
+    # 内部同步方法
+    # ------------------------------------------------------------------
+    def _sync_dockerfile_repair_aliases(self):
+        """把 dockerfile_repair 的直观字段与 agent_configs 同步。"""
+        if "dockerfile_repair" not in self.agent_configs:
+            self.agent_configs["dockerfile_repair"] = AgentConfig(
+                RECOMMENDED_MODELS["dockerfile_repair"]
+            )
+
+        self.agent_configs["dockerfile_repair"].model = self.dockerfile_repair_model
+        self.agent_configs["dockerfile_repair"].api_key = self.dockerfile_repair_api_key
+        self.agent_configs["dockerfile_repair"].base_url = self.dockerfile_repair_base_url
+
+    # ------------------------------------------------------------------
+    # 兼容旧接口
+    # ------------------------------------------------------------------
+    def set_api_key(self, api_key: str):
+        """兼容旧接口：设置全局 API Key"""
+        self.set_global_api_key(api_key)
+
+    def set_base_url(self, base_url: str):
+        """兼容旧接口：设置全局 Base URL"""
+        self.set_global_base_url(base_url)
+
+    def set_agent_model(self, agent_type: str, model: str):
+        """兼容旧接口：设置某个智能体模型"""
+        ok = self.set_agent_config(agent_type=agent_type, model=model)
+        if not ok:
+            raise ValueError(f"设置 {agent_type} 模型失败: {model}")
+
+    def set_dockerfile_repair_model(self, model: str):
+        """专用接口：设置 Dockerfile 修复智能体模型"""
+        if not self._is_model_supported(model):
+            raise ValueError(f"模型 '{model}' 不在支持列表中")
+        self.dockerfile_repair_model = model
+        self._sync_dockerfile_repair_aliases()
+        print(f"✅ Dockerfile 修复模型设置成功: {model}")
+
+    def set_dockerfile_repair_config(
+        self,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None
+    ) -> bool:
+        """专用接口：设置 Dockerfile 修复智能体配置"""
+        if model is not None and model != "":
+            if not self._is_model_supported(model):
+                print(f"❌ Dockerfile 修复模型 '{model}' 不在支持列表中")
+                return False
+            self.dockerfile_repair_model = model
+
+        if api_key is not None:
+            if api_key and len(api_key) < 10:
+                print("❌ Dockerfile 修复智能体的 API Key 无效")
+                return False
+            self.dockerfile_repair_api_key = api_key if api_key else None
+
+        if base_url is not None:
+            self.dockerfile_repair_base_url = base_url if base_url else None
+
+        self._sync_dockerfile_repair_aliases()
+        print("✅ Dockerfile 修复智能体配置已更新")
+        return True
+
+    # ------------------------------------------------------------------
+    # 全局配置
+    # ------------------------------------------------------------------
     def set_global_api_key(self, api_key: str):
         """设置全局API Key"""
         if not api_key or len(api_key) < 10:
             raise ValueError("API Key 无效，请输入有效的API Key")
         self.global_api_key = api_key
+        self.api_key = api_key
         print("✅ 全局API Key 设置成功")
 
     def set_global_base_url(self, base_url: str):
         """设置全局Base URL"""
+        if not base_url:
+            raise ValueError("Base URL 不能为空")
         self.global_base_url = base_url
+        self.base_url = base_url
         print(f"✅ 全局API Base URL 设置为: {base_url}")
 
+    # ------------------------------------------------------------------
+    # 智能体配置
+    # ------------------------------------------------------------------
     def set_agent_config(
-        self, 
-        agent_type: str, 
+        self,
+        agent_type: str,
         model: str = None,
         api_key: str = None,
         base_url: str = None
@@ -90,24 +215,29 @@ class CXXCrafterConfig:
             return False
 
         agent_cfg = self.agent_configs[agent_type]
-        
+
         # 更新模型
         if model:
             if not self._is_model_supported(model):
                 print(f"❌ 模型 '{model}' 不在支持列表中")
                 return False
             agent_cfg.model = model
-        
+
         # 更新独立API Key
         if api_key is not None:
             if api_key and len(api_key) < 10:
                 print(f"❌ {agent_type} 智能体的API Key无效")
                 return False
             agent_cfg.api_key = api_key if api_key else None
-        
+
         # 更新独立Base URL
         if base_url is not None:
             agent_cfg.base_url = base_url if base_url else None
+
+        if agent_type == "dockerfile_repair":
+            self.dockerfile_repair_model = agent_cfg.model
+            self.dockerfile_repair_api_key = agent_cfg.api_key
+            self.dockerfile_repair_base_url = agent_cfg.base_url
 
         print(f"✅ {agent_type} 智能体配置已更新")
         return True
@@ -133,24 +263,76 @@ class CXXCrafterConfig:
                 "independent": False
             }
 
+    def get_dockerfile_repair_credentials(self) -> Dict[str, Any]:
+        """获取 Dockerfile 修复智能体的凭证"""
+        return self.get_agent_credentials("dockerfile_repair")
+
     def reset_to_recommended(self):
         """重置为推荐配置"""
-        for agent_type in self.agent_configs:
-            self.agent_configs[agent_type] = AgentConfig(RECOMMENDED_MODELS[agent_type])
+        self.agent_configs = {
+            "dependency": AgentConfig(RECOMMENDED_MODELS["dependency"]),
+            "build": AgentConfig(RECOMMENDED_MODELS["build"]),
+            "error": AgentConfig(RECOMMENDED_MODELS["error"]),
+            "coordinator": AgentConfig(RECOMMENDED_MODELS["coordinator"]),
+            "dockerfile_repair": AgentConfig(RECOMMENDED_MODELS["dockerfile_repair"]),
+        }
+
+        self.dockerfile_repair_model = RECOMMENDED_MODELS["dockerfile_repair"]
+        self.dockerfile_repair_api_key = None
+        self.dockerfile_repair_base_url = None
+
         print("✅ 已重置为推荐配置")
 
     def _is_model_supported(self, model: str) -> bool:
-        for provider, models in SUPPORTED_MODELS.items():
+        for _, models in SUPPORTED_MODELS.items():
             if model in models:
                 return True
         return False
 
+    # ------------------------------------------------------------------
+    # 读取环境变量
+    # ------------------------------------------------------------------
+    def load_from_env(self):
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL")
+
+        if api_key:
+            self.global_api_key = api_key
+            self.api_key = api_key
+        if base_url:
+            self.global_base_url = base_url
+            self.base_url = base_url
+
+        # Dockerfile 修复智能体专用环境变量（可选）
+        repair_api_key = os.getenv("DOCKERFILE_REPAIR_API_KEY")
+        repair_base_url = os.getenv("DOCKERFILE_REPAIR_BASE_URL")
+        repair_model = os.getenv("DOCKERFILE_REPAIR_MODEL")
+
+        if repair_api_key:
+            self.dockerfile_repair_api_key = repair_api_key
+        if repair_base_url:
+            self.dockerfile_repair_base_url = repair_base_url
+        if repair_model and self._is_model_supported(repair_model):
+            self.dockerfile_repair_model = repair_model
+
+    # ------------------------------------------------------------------
+    # 配置摘要
+    # ------------------------------------------------------------------
     def get_config_summary(self) -> str:
-        summary = "\n" + "="*60 + "\n"
+        summary = "\n" + "=" * 60 + "\n"
         summary += "CXXCrafter 配置摘要\n"
-        summary += "="*60 + "\n"
+        summary += "=" * 60 + "\n"
         summary += f"全局API Key: {'已设置' if self.global_api_key else '未设置'}\n"
         summary += f"全局Base URL: {self.global_base_url}\n"
+        summary += f"最大修复轮次: {self.max_rounds}\n"
+        summary += f"启用迭代修复: {'是' if self.enable_iterative_repair else '否'}\n"
+        summary += f"启用构建缓存: {'是' if self.enable_build_cache else '否'}\n"
+        summary += f"Dockerfile未变化时跳过重建: {'是' if self.skip_rebuild_if_unchanged else '否'}\n"
+        summary += f"启用BuildKit: {'是' if self.use_buildkit else '否'}\n"
+        summary += f"BuildKit输出模式: {'plain' if self.buildkit_progress_plain else 'default'}\n"
+        summary += f"缓存目录: {self.cache_dir}\n"
+        summary += f"默认基础镜像: {self.base_image}\n"
+
         summary += "\n智能体配置:\n"
         for agent, cfg in self.agent_configs.items():
             cred = self.get_agent_credentials(agent)
@@ -158,13 +340,12 @@ class CXXCrafterConfig:
             summary += f"  {agent}:\n"
             summary += f"    模型: {cfg.model}{indep}\n"
             summary += f"    API Key: {'已设置' if cred['api_key'] else '未设置'}\n"
-        summary += "="*60 + "\n"
-        return summary
+            summary += f"    Base URL: {cred['base_url']}\n"
 
-    def load_from_env(self):
-        api_key = os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("OPENAI_BASE_URL")
-        if api_key:
-            self.global_api_key = api_key
-        if base_url:
-            self.global_base_url = base_url
+        summary += "\nDockerfile 修复专用字段:\n"
+        summary += f"  dockerfile_repair_model: {self.dockerfile_repair_model}\n"
+        summary += f"  dockerfile_repair_api_key: {'已设置' if self.dockerfile_repair_api_key else '未设置'}\n"
+        summary += f"  dockerfile_repair_base_url: {self.dockerfile_repair_base_url or self.global_base_url}\n"
+
+        summary += "=" * 60 + "\n"
+        return summary

@@ -1,3 +1,8 @@
-from .settings import CXXCrafterConfig, SUPPORTED_MODELS
+from .settings import CXXCrafterConfig, AgentConfig, SUPPORTED_MODELS, RECOMMENDED_MODELS
 
-__all__ = ["CXXCrafterConfig", "SUPPORTED_MODELS"]
+__all__ = [
+    "CXXCrafterConfig",
+    "AgentConfig",
+    "SUPPORTED_MODELS",
+    "RECOMMENDED_MODELS",
+]

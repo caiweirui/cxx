@@ -1,12 +1,15 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# CXXCrafter Ubuntu命令行运行脚本
-echo "=========================================="
-echo "CXXCrafter 命令行模式 - Ubuntu"
-echo "=========================================="
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
 
-# 激活虚拟环境
-source .venv/bin/activate
+if [ -d ".venv" ]; then
+  # shellcheck disable=SC1091
+  source ".venv/bin/activate"
+fi
 
-# 运行
-python src/cxxcrafter/run.py "$@"
+export PYTHONUTF8=1
+export PYTHONIOENCODING="utf-8"
+
+python3 -m cxxcrafter.cli "$@"

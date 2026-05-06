@@ -1,10 +1,6 @@
 from .dockerfile_template import dockerfile_template
 
-
-
-
-
-def get_initial_prompt(project_name, user_intention, environment_requirement, dependency, docs):
+def get_initial_prompt(project_name, user_intention, environment_requirement, dependency, docs, source_dir_rel="."):
     """
     Get the initial prompt.
     """
@@ -13,23 +9,31 @@ def get_initial_prompt(project_name, user_intention, environment_requirement, de
     else:
         potential_dependency = dependency
 
+    if source_dir_rel and source_dir_rel != ".":
+        source_location_desc = f"./{source_dir_rel}"
+    else:
+        source_location_desc = "the project root inside the container"
+
     prompt_template = f"""
-        Please generate dockerfile which build the project {project_name} from source code accordind to the dockerfile template {dockerfile_template}.
-        The source code is located at {"./"+project_name}. Move it to the docker container temp directory and build.
+        Please generate a Dockerfile which builds the project {project_name} from source code according to the Dockerfile template {dockerfile_template}.
+        The source code is located at {source_location_desc} inside the Docker build context.
+        Do not assume that /workspace itself is the source root unless the build root detection confirms it.
+
         Requirements:
             1. Install commands must be executed one at a time.
             2. Avoid repeating identical RUN commands.
             3. Please adhere to Dockerfile syntax. For example, ensure that comments and commands are on separate lines. Comments should start with a # and be placed independently of commands.
+            4. If the project is CMake-based, use the real source directory instead of hardcoding /workspace.
+            5. If the project is Makefile-based, search for the Makefile and run make in its directory.
+
         {user_intention}
+
         Some useful information:
             Environment requirement: {environment_requirement}
             Docs: {docs}
             Potential Dependencies (skip installation if useless): {potential_dependency}
     """
     return prompt_template
-
-
-
 
 prompt_template_for_modification = """
     Solve the problem according to the error message and modify the dockerfile.
@@ -45,4 +49,4 @@ prompt_template_for_modification = """
     6. If required packages, tools, or dependencies are missing, proceed with installing them rather than just verifying their presence.
     7. In case errors arise due to specific dependency versions, attempt to acquire and install the exact version of the software that is required.
     8. If a 404 error occurs while attempting to download a specific dependency version, verify the correctness of the download link and make any necessary corrections.
-    """
+"""
