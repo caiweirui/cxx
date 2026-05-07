@@ -21,11 +21,16 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+os.environ.setdefault("LLM_USAGE_LOG_PATH", str(PROJECT_ROOT / "logs" / "llm_usage.log"))
+os.environ.setdefault("LLM_TRACE_LOG_PATH", str(PROJECT_ROOT / "logs" / "llm_trace.jsonl"))
+os.environ.setdefault("AGENT_TRACE_LOG_PATH", str(PROJECT_ROOT / "logs" / "agent_trace.jsonl"))
+
 from cxxcrafter.cli import (
     AgentRuntimeConfig,
     CXXCrafterCLI,
     CXXCrafterConfig,
 )
+
 from cxxcrafter.execution.batch_executor import BatchExecutor
 from cxxcrafter.runtime.os_compat import format_os_tip, open_path
 
@@ -55,6 +60,23 @@ def _safe_float(value: Any, default: float) -> float:
         return float(str(value).strip())
     except Exception:
         return default
+
+def _parse_optional_positive_float(value: Any) -> Optional[float]:
+    """
+    将输入解析为可选正数浮点数：
+    - 空字符串 / None / 0 / 0.0 / 非法值 => None
+    - 正数 => float
+    """
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        num = float(text)
+        if num <= 0:
+            return None
+        return num
+    except Exception:
+        return None
 
 def _summary_status(summary: Dict[str, Any]) -> str:
     return str(summary.get("overall_status", "") or "").lower().strip()
@@ -148,11 +170,7 @@ def build_cli_from_config(config: Dict[str, Any]) -> CXXCrafterCLI:
         image_tag=strip_outer_quotes(config.get("image_tag", "")) or None,
         build_timeout_seconds=_safe_float(config.get("build_timeout_seconds", 1800), 1800.0),
         verify_timeout_seconds=_safe_float(config.get("verify_timeout_seconds", 600), 600.0),
-        project_timeout_seconds=(
-            _safe_float(config.get("project_timeout_seconds", 0), 0.0)
-            if str(config.get("project_timeout_seconds", "")).strip()
-            else None
-        ),
+        project_timeout_seconds=_parse_optional_positive_float(config.get("project_timeout_seconds", None)),
         enable_rag=bool(config.get("enable_rag", True)),
         use_buildkit=bool(config.get("use_buildkit", True)),
         buildkit_progress=str(config.get("buildkit_progress", "plain") or "plain"),
@@ -324,11 +342,7 @@ class CXXCrafterGUI:
             "enable_rag": bool(self.enable_rag_var.get()),
             "build_timeout_seconds": _safe_float(self.build_timeout_seconds_var.get(), 1800.0),
             "verify_timeout_seconds": _safe_float(self.verify_timeout_seconds_var.get(), 600.0),
-            "project_timeout_seconds": (
-                _safe_float(self.project_timeout_seconds_var.get(), 0.0)
-                if self.project_timeout_seconds_var.get().strip()
-                else None
-            ),
+            "project_timeout_seconds": _parse_optional_positive_float(self.project_timeout_seconds_var.get()),
         }
 
         for key, _label in AGENT_LABELS:
@@ -634,9 +648,11 @@ class CXXCrafterGUI:
             log_dir = strip_outer_quotes(self.logs_dir_var.get().strip() or str(PROJECT_ROOT / "data" / "build_logs"))
             build_timeout_seconds = _safe_float(self.build_timeout_seconds_var.get(), 1800.0)
             verify_timeout_seconds = _safe_float(self.verify_timeout_seconds_var.get(), 600.0)
-            project_timeout_text = self.project_timeout_seconds_var.get().strip()
-            project_timeout_seconds = _safe_float(project_timeout_text, 0.0) if project_timeout_text else None
-            max_consecutive_failures = _safe_int(self.max_consecutive_failures_var.get(), 3)
+
+            # 关键修复：空值 / 0 / 0.0 都视为未启用项目总超时
+            project_timeout_seconds = _parse_optional_positive_float(self.project_timeout_seconds_var.get())
+
+            max_consecutive_failures = _safe_int(self.max_consecutive_failures_var.get(), 100)
             stop_on_docker_error = bool(self.stop_on_docker_error_var.get())
 
             self._append_line(f"验证开关: {self.enable_verify_var.get()}")
@@ -646,7 +662,7 @@ class CXXCrafterGUI:
             self._append_line(f"日志目录: {log_dir}")
             self._append_line(f"构建超时(秒): {build_timeout_seconds}")
             self._append_line(f"验证超时(秒): {verify_timeout_seconds}")
-            self._append_line(f"项目总超时(秒): {project_timeout_text}")
+            self._append_line(f"项目总超时(秒): {self.project_timeout_seconds_var.get().strip()}")
             self._append_line(f"连续失败阈值: {max_consecutive_failures}")
             self._append_line(f"停止于 Docker 异常: {stop_on_docker_error}")
             self._append_line("")
@@ -961,7 +977,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--build-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--verify-timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--project-timeout-seconds", type=float, default=0.0)
+
+    # 关键修复：默认 None，表示未启用项目总超时
+    parser.add_argument("--project-timeout-seconds", type=float, default=None)
+
     parser.add_argument("--stop-on-docker-error", action="store_true", default=True)
     parser.add_argument("--no-stop-on-docker-error", action="store_true")
     parser.add_argument("--max-consecutive-failures", type=int, default=3)
@@ -990,6 +1009,9 @@ def run_headless(args: argparse.Namespace) -> Dict[str, Any]:
         "build_use_separate_config": False,
         "error_use_separate_config": False,
         "repair_use_separate_config": False,
+
+        # 给 build_cli_from_config 用
+        "project_timeout_seconds": args.project_timeout_seconds,
     }
 
     cli = build_cli_from_config(config)

@@ -13,6 +13,7 @@ from cxxcrafter.agents.coordinator import CXXCrafterCoordinator
 from cxxcrafter.agents.dependency_agent import DependencyAgent
 from cxxcrafter.agents.dockerfile_repair_agent import DockerfileRepairAgent
 from cxxcrafter.agents.error_agent import ErrorAgent
+from cxxcrafter.llm.bot import GPTBot
 from cxxcrafter.execution.executor import DockerExecutor
 from cxxcrafter.generation_module.dockerfile_generator import DockerfileGenerator
 
@@ -74,6 +75,7 @@ class CXXCrafterConfig:
     max_repair_rounds: int = 2
     output_dir: str = "./output"
     log_dir: str = "./logs"
+    failure_log_path: Optional[str] = "./logs/all_failed_builds.log"
 
     enable_build: bool = True
     enable_verification: bool = True
@@ -94,11 +96,42 @@ class CXXCrafterConfig:
     buildkit_progress: str = "plain"
     default_base_image: str = "ubuntu:22.04"
 
+    # LLM / Trace 日志路径
+    cache_dir: str = "./data/cache"
+    llm_usage_log_path: str = "./logs/llm_usage.log"
+    llm_trace_log_path: str = "./logs/llm_trace.jsonl"
+    agent_trace_log_path: str = "./logs/agent_trace.jsonl"
+
     # 四个核心 agent 的独立配置
     dependency_agent: AgentRuntimeConfig = field(default_factory=AgentRuntimeConfig)
     build_agent: AgentRuntimeConfig = field(default_factory=AgentRuntimeConfig)
     error_agent: AgentRuntimeConfig = field(default_factory=AgentRuntimeConfig)
     repair_agent: AgentRuntimeConfig = field(default_factory=AgentRuntimeConfig)
+
+@dataclass
+class _GPTBotConfigShim:
+    """
+    最小 GPTBot 配置适配器：
+    - 兼容 GPTBot(config=...) 的读取方式
+    - 提供 get_agent_credentials("coordinator")
+    - 提供 cache_dir / llm_usage_log_path / llm_trace_log_path
+    """
+    global_api_key: Optional[str]
+    global_base_url: Optional[str]
+    global_model: Optional[str]
+    cache_dir: str
+    llm_usage_log_path: str
+    llm_trace_log_path: str
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+
+    def get_agent_credentials(self, _agent_name: str) -> Dict[str, Any]:
+        return {
+            "api_key": self.api_key or self.global_api_key,
+            "base_url": self.base_url or self.global_base_url,
+            "model": self.model or self.global_model,
+        }
 
 class CXXCrafterCLI:
     """
@@ -137,6 +170,11 @@ class CXXCrafterCLI:
             use_buildkit=bool(config.use_buildkit),
             buildkit_progress=str(config.buildkit_progress or "plain"),
             default_base_image=str(config.default_base_image or "ubuntu:22.04"),
+            failure_log_path=str(config.failure_log_path) if config.failure_log_path else None,
+            cache_dir=str(config.cache_dir or "./data/cache"),
+            llm_usage_log_path=str(config.llm_usage_log_path or "./logs/llm_usage.log"),
+            llm_trace_log_path=str(config.llm_trace_log_path or "./logs/llm_trace.jsonl"),
+            agent_trace_log_path=str(config.agent_trace_log_path or "./logs/agent_trace.jsonl"),
         )
 
     def _build_rag_service(self, config: CXXCrafterConfig) -> Any:
@@ -201,10 +239,55 @@ class CXXCrafterCLI:
             base_url=agent_cfg.base_url or global_cfg.base_url,
         )
 
-    def _agent_kwargs(self, cfg: CXXCrafterConfig, agent_cfg: AgentRuntimeConfig, rag_service: Any) -> Dict[str, Any]:
+    def _build_gptbot(self, cfg: CXXCrafterConfig, agent_cfg: AgentRuntimeConfig) -> GPTBot:
+        """
+        给某个 Agent 构造一个独立 GPTBot 实例：
+        - 共享同一套 OpenAI 账号配置
+        - 但每个 Agent 保留独立 messages / cache / 日志路径
+        """
+        effective = self._resolve_agent_runtime(agent_cfg, cfg)
+
+        shim = _GPTBotConfigShim(
+            global_api_key=cfg.api_key,
+            global_base_url=cfg.base_url,
+            global_model=cfg.model_name,
+            cache_dir=cfg.cache_dir,
+            llm_usage_log_path=cfg.llm_usage_log_path,
+            llm_trace_log_path=cfg.llm_trace_log_path,
+            api_key=effective.api_key,
+            base_url=effective.base_url,
+            model=effective.model_name,
+        )
+
+        # GPTBot 会从 config.get_agent_credentials("coordinator") 读取
+        return GPTBot(
+            model=effective.model_name or cfg.model_name or "gpt-5.4-mini",
+            config=shim,
+        )
+
+    def _prime_agent_runtime(self, agent: Any, cfg: CXXCrafterConfig) -> None:
+        """
+        给 BaseAgent 注入运行时上下文：
+        - use_cache 真正传到 LLM 调用
+        - 统一写日志路径
+        """
+        if agent is None:
+            return
+
+        try:
+            if hasattr(agent, "set_runtime_context") and callable(getattr(agent, "set_runtime_context")):
+                agent.set_runtime_context(
+                    use_cache=cfg.use_cache,
+                    usage_log_path=cfg.llm_usage_log_path,
+                    trace_log_path=cfg.agent_trace_log_path,
+                )
+        except Exception:
+            pass
+
+    def _agent_kwargs(self, cfg: CXXCrafterConfig, agent_cfg: AgentRuntimeConfig, rag_service: Any, bot: Any) -> Dict[str, Any]:
         effective = self._resolve_agent_runtime(agent_cfg, cfg)
         return {
-            "bot": cfg.bot,
+            "bot": bot,
             "model_name": effective.model_name,
             "api_key": effective.api_key,
             "base_url": effective.base_url,
@@ -216,22 +299,33 @@ class CXXCrafterCLI:
         cfg = config or self.config
         rag_service = cfg.rag_service if cfg.rag_service is not None else self._rag_service
 
+        # 如果外部已经传了一个共享 bot，就直接复用；
+        # 否则为每个 Agent 创建独立 GPTBot，避免消息历史互相污染。
+        dependency_bot = cfg.bot if cfg.bot is not None else self._build_gptbot(cfg, cfg.dependency_agent)
+        build_bot = cfg.bot if cfg.bot is not None else self._build_gptbot(cfg, cfg.build_agent)
+        error_bot = cfg.bot if cfg.bot is not None else self._build_gptbot(cfg, cfg.error_agent)
+        repair_bot = cfg.bot if cfg.bot is not None else self._build_gptbot(cfg, cfg.repair_agent)
+
         dependency_agent = _instantiate(
             DependencyAgent,
-            **self._agent_kwargs(cfg, cfg.dependency_agent, rag_service),
+            **self._agent_kwargs(cfg, cfg.dependency_agent, rag_service, dependency_bot),
         )
         build_agent = _instantiate(
             BuildAgent,
-            **self._agent_kwargs(cfg, cfg.build_agent, rag_service),
+            **self._agent_kwargs(cfg, cfg.build_agent, rag_service, build_bot),
         )
         error_agent = _instantiate(
             ErrorAgent,
-            **self._agent_kwargs(cfg, cfg.error_agent, rag_service),
+            **self._agent_kwargs(cfg, cfg.error_agent, rag_service, error_bot),
         )
         repair_agent = _instantiate(
             DockerfileRepairAgent,
-            **self._agent_kwargs(cfg, cfg.repair_agent, rag_service),
+            **self._agent_kwargs(cfg, cfg.repair_agent, rag_service, repair_bot),
         )
+
+        # 给所有 Agent 注入运行时上下文，确保 use_cache 和日志路径真正生效
+        for agent in (dependency_agent, build_agent, error_agent, repair_agent):
+            self._prime_agent_runtime(agent, cfg)
 
         docker_executor = DockerExecutor(
             use_buildkit=cfg.use_buildkit,
@@ -268,6 +362,7 @@ class CXXCrafterCLI:
         project_path: str,
         output_dir: Optional[str] = None,
         log_dir: Optional[str] = None,
+        failure_log_path: Optional[str] = None,
         **overrides: Any,
     ) -> Dict[str, Any]:
         cfg = self._resolve_config(
@@ -275,14 +370,18 @@ class CXXCrafterCLI:
                 **overrides,
                 "output_dir": output_dir if output_dir is not None else self.config.output_dir,
                 "log_dir": log_dir if log_dir is not None else self.config.log_dir,
+                "failure_log_path": failure_log_path if failure_log_path is not None else self.config.failure_log_path,
             }
         )
 
         output_dir_path = str(Path(cfg.output_dir).expanduser().resolve())
         log_dir_path = str(Path(cfg.log_dir).expanduser().resolve())
+        failure_log_path_path = str(Path(cfg.failure_log_path).expanduser().resolve()) if cfg.failure_log_path else None
 
         Path(output_dir_path).mkdir(parents=True, exist_ok=True)
         Path(log_dir_path).mkdir(parents=True, exist_ok=True)
+        if failure_log_path_path:
+            Path(failure_log_path_path).parent.mkdir(parents=True, exist_ok=True)
 
         coordinator = self.create_coordinator(cfg)
         return coordinator.process_project(
@@ -297,6 +396,7 @@ class CXXCrafterCLI:
             build_timeout_seconds=cfg.build_timeout_seconds,
             verify_timeout_seconds=cfg.verify_timeout_seconds,
             project_timeout_seconds=cfg.project_timeout_seconds,
+            failure_log_path=failure_log_path_path,
         )
 
     # 兼容旧调用名
@@ -313,6 +413,7 @@ class CXXCrafterCLI:
         parser.add_argument("project_path", help="项目路径")
         parser.add_argument("--output-dir", default=self.config.output_dir, help="输出目录")
         parser.add_argument("--log-dir", default=self.config.log_dir, help="日志目录")
+        parser.add_argument("--failure-log", default=self.config.failure_log_path, help="所有失败项目统一追加的日志文件")
         parser.add_argument("--image-tag", default=self.config.image_tag, help="Docker 镜像标签")
         parser.add_argument("--model-name", default=self.config.model_name, help="模型名称")
         parser.add_argument("--api-key", default=self.config.api_key, help="API Key")
@@ -341,6 +442,7 @@ class CXXCrafterCLI:
         cfg = self._resolve_config(
             output_dir=args.output_dir,
             log_dir=args.log_dir,
+            failure_log_path=args.failure_log,
             image_tag=args.image_tag,
             model_name=args.model_name,
             api_key=args.api_key,
@@ -364,6 +466,7 @@ class CXXCrafterCLI:
             project_path=args.project_path,
             output_dir=cfg.output_dir,
             log_dir=cfg.log_dir,
+            failure_log_path=cfg.failure_log_path,
             model_name=cfg.model_name,
             api_key=cfg.api_key,
             base_url=cfg.base_url,

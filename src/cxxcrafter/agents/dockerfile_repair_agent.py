@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Dict, List, Optional
 
 from .base_agent import BaseAgent
@@ -17,12 +17,12 @@ def _as_str_list(value: Any) -> List[str]:
     if not value:
         return []
     if isinstance(value, list):
-        return [str(x) for x in value if str(x).strip()]
+        return [str(x).strip() for x in value if str(x).strip()]
     if isinstance(value, tuple):
-        return [str(x) for x in value if str(x).strip()]
+        return [str(x).strip() for x in value if str(x).strip()]
     if isinstance(value, set):
-        return [str(x) for x in value if str(x).strip()]
-    return [str(value)]
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [str(value).strip()] if str(value).strip() else []
 
 def _merge_unique(*lists: List[str]) -> List[str]:
     out: List[str] = []
@@ -44,6 +44,20 @@ def _truncate(text: str, limit: int = 5000) -> str:
         return text
     return text[: limit - 3] + "..."
 
+def _to_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if is_dataclass(value):
+        return asdict(value)
+    if hasattr(value, "__dict__"):
+        try:
+            return dict(value.__dict__)
+        except Exception:
+            return {}
+    return {}
+
 @dataclass
 class RepairPatch:
     add_apt_packages: List[str] = field(default_factory=list)
@@ -61,6 +75,12 @@ class RepairPatch:
 class DockerfileRepairAgent(BaseAgent):
     """
     根据错误分析给 BuildPlan 打补丁，并使用 RAG 进行历史经验增强。
+
+    重点增强：
+    - 识别 COPY / 路径空格 / source_root 子目录问题
+    - 识别 autotools 的 CRLF / bad interpreter 问题
+    - 识别常见依赖缺失
+    - 对“构建失败但验证未开始”的情况更保守地做最小修复
     """
 
     def __init__(
@@ -87,6 +107,9 @@ class DockerfileRepairAgent(BaseAgent):
         current_plan: BuildPlan,
         failure: Dict[str, Any],
     ) -> RepairPatch:
+        snapshot = _to_dict(snapshot)
+        failure = _to_dict(failure)
+
         error_query = self._extract_error_query(failure)
         project_path = str(snapshot.get("project_path", "") or "")
         rag_context = self._extract_rag_context(failure)
@@ -102,16 +125,30 @@ class DockerfileRepairAgent(BaseAgent):
                 rag_context = ""
 
         prompt = f"""
-你是 Dockerfile 修复智能体，只输出 JSON，不要输出解释文字。
+你是 Dockerfile / BuildPlan 修复智能体，只输出 JSON，不要输出解释文字。
 
-目标：基于当前构建计划、失败诊断和 RAG 历史案例，输出最小修复补丁。
-约束：
-1. 只输出补丁，不要重写完整计划
-2. 修复动作必须尽量小
-3. 不要添加无关依赖
-4. 如果某个 test 命令明显错误，优先移除它，而不是强行修复
-5. 如果需要补依赖，尽量补最少必要依赖
-6. RAG 历史案例只能作为参考，不能违反失败诊断
+目标：
+- 基于当前构建计划、失败诊断和 RAG 历史案例，输出“最小修复补丁”
+- 只修正导致失败的点
+- 不要重写完整计划
+- 不要引入不必要的新依赖
+- 如果某个 test/build 命令明显错误，优先移除，而不是强行修复
+- 如果失败是 Dockerfile 生成问题（例如 COPY 路径、空格、CRLF、bad interpreter），优先给出最小增量修复建议
+- 如果失败是 source_root_rel 子目录问题，优先通过保持相对路径 / 进入子目录解决，不要盲目加包
+
+特别注意本次常见失败模式：
+1) COPY 路径空格 / JSON array COPY：
+   - 这类问题通常不是缺包
+   - 如果看到 failed to calculate checksum / COPY / not found / /workspace/test 之类错误，
+     优先在 notes 里说明“需要 JSON array COPY / 正确处理 source_root_rel”
+2) autotools CRLF：
+   - 如果看到 bad interpreter /bin/sh^M / CRLF / carriage return，
+     优先添加预处理命令：
+       sed -i 's/\\r$//' ./autogen.sh ./configure 2>/dev/null || true
+       chmod +x ./autogen.sh ./configure 2>/dev/null || true
+3) build 失败但验证未开始：
+   - 只做 build 侧最小修复
+4) 如果错误明显来自 cmake/ninja/pkg-config 缺失，再补最少必要依赖
 
 JSON 结构：
 {{
@@ -128,13 +165,13 @@ JSON 结构：
 }}
 
 项目快照：
-{snapshot}
+{json.dumps(snapshot, ensure_ascii=False, indent=2)}
 
 当前构建计划：
 {current_plan}
 
 失败分析：
-{_truncate(json.dumps(failure, ensure_ascii=False, indent=2), 10000)}
+{_truncate(json.dumps(failure, ensure_ascii=False, indent=2), 12000)}
 
 RAG 历史案例参考：
 {rag_context or "无"}
@@ -171,7 +208,7 @@ RAG 历史案例参考：
             add_test_commands=_as_str_list(data.get("add_test_commands", [])),
             remove_build_commands=_as_str_list(data.get("remove_build_commands", [])),
             remove_test_commands=_as_str_list(data.get("remove_test_commands", [])),
-            replace_base_image=str(data.get("replace_base_image", "")),
+            replace_base_image=str(data.get("replace_base_image", "") or ""),
             notes=_as_str_list(data.get("notes", [])),
             confidence=confidence,
             raw=data,
@@ -179,6 +216,7 @@ RAG 历史案例参考：
 
         final_patch = self._merge_patches(llm_patch, heuristic)
 
+        # 回写 RAG 成功/失败经验
         if self.rag_service is not None and error_query:
             try:
                 project_name = str(snapshot.get("project_name") or snapshot.get("project_path") or "unknown")
@@ -211,19 +249,24 @@ RAG 历史案例参考：
     def _extract_error_query(self, failure: Dict[str, Any]) -> str:
         parts: List[str] = []
 
+        # 优先抓 raw 内的 build_log / dockerfile_text / rag_context
         raw = failure.get("raw", {})
         if isinstance(raw, dict):
-            for key in ("build_log", "message", "rag_context"):
+            for key in ("build_log", "build_log_excerpt", "dockerfile_text", "message", "rag_context"):
                 v = raw.get(key)
                 if v:
                     parts.append(str(v))
 
+        # 兼容 flat 字段
         for key in (
             "likely_causes",
             "suggested_actions",
             "notes",
             "raw",
             "message",
+            "build_log",
+            "build_log_excerpt",
+            "dockerfile_text",
         ):
             v = failure.get(key)
             if isinstance(v, (list, tuple, set)):
@@ -247,7 +290,17 @@ RAG 历史案例参考：
     def _heuristic_patch_from_failure(self, current_plan: BuildPlan, failure: Dict[str, Any]) -> RepairPatch:
         text_parts: List[str] = []
 
-        for key in ("likely_causes", "suggested_actions", "notes", "raw", "message"):
+        for key in (
+            "likely_causes",
+            "suggested_actions",
+            "notes",
+            "raw",
+            "message",
+            "build_log",
+            "build_log_excerpt",
+            "dockerfile_text",
+            "verification_log",
+        ):
             v = failure.get(key)
             if isinstance(v, (list, tuple, set)):
                 text_parts.extend([str(x) for x in v])
@@ -256,7 +309,7 @@ RAG 历史案例参考：
 
         raw = failure.get("raw", {})
         if isinstance(raw, dict):
-            for key in ("build_log", "rag_context"):
+            for key in ("build_log", "build_log_excerpt", "dockerfile_text", "rag_context"):
                 v = raw.get(key)
                 if v:
                     text_parts.append(str(v))
@@ -265,6 +318,19 @@ RAG 历史案例参考：
 
         patch = RepairPatch()
 
+        def add_pkg(pkg: str) -> None:
+            if pkg and pkg not in patch.add_apt_packages:
+                patch.add_apt_packages.append(pkg)
+
+        def add_pre(cmd: str) -> None:
+            if cmd and cmd not in patch.add_preinstall_commands:
+                patch.add_preinstall_commands.append(cmd)
+
+        def add_note(note: str) -> None:
+            if note and note not in patch.notes:
+                patch.notes.append(note)
+
+        # ---------- 常见工具缺失 ----------
         tool_pkg_map = [
             (r"\bcmake\b.*(not found|command not found|missing)", "cmake"),
             (r"\bninja\b.*(not found|command not found|missing)", "ninja-build"),
@@ -275,59 +341,119 @@ RAG 历史案例参考：
             (r"\bpython3\b.*(not found|command not found|missing)", "python3"),
             (r"\bpip\b.*(not found|command not found|missing)", "python3-pip"),
         ]
-
-        inferred_packages: List[str] = []
         for pattern, pkg in tool_pkg_map:
             if re.search(pattern, text, re.I):
-                inferred_packages.append(pkg)
-
-        patch.add_apt_packages = _merge_unique(patch.add_apt_packages, inferred_packages)
+                add_pkg(pkg)
 
         if "module not found" in text and ("python" in text or "pip" in text):
-            patch.add_apt_packages = _merge_unique(
-                patch.add_apt_packages,
-                ["python3", "python3-pip", "python3-venv"],
-            )
+            add_pkg("python3")
+            add_pkg("python3-pip")
+            add_pkg("python3-venv")
 
+        # ---------- COPY / 路径 / source_root 问题 ----------
+        if any(
+            s in text
+            for s in [
+                "failed to calculate checksum",
+                "copy failed",
+                "no such file or directory",
+                "/workspace/test",
+                "not found",
+                "can't stat",
+            ]
+        ) and ("copy" in text or "dockerfile" in text or "/workspace/" in text):
+            add_note("Detected Docker COPY/path failure: use JSON-array COPY and keep source_root_rel as a quoted relative path.")
+            add_note("If source_root_rel contains spaces, COPY must not be rendered as `COPY a b`; use `COPY [\"a\", \"b\"]`.")
+
+        # ---------- autotools / CRLF / bad interpreter ----------
+        if any(
+            s in text
+            for s in [
+                "bad interpreter",
+                "/bin/sh^m",
+                "carriage return",
+                "crlf",
+                "dos line endings",
+                "mismatched shebang",
+            ]
+        ):
+            add_pre(r"sed -i 's/\r$//' ./autogen.sh ./configure 2>/dev/null || true")
+            add_pre(r"chmod +x ./autogen.sh ./configure 2>/dev/null || true")
+            add_note("CRLF / bad interpreter detected; normalize autogen.sh/configure line endings before running autotools scripts.")
+
+        # ---------- autotools / invalid test target ----------
         if "no rule to make target 'test'" in text or 'no rule to make target "test"' in text or "target 'test' not found" in text:
             patch.remove_test_commands = _merge_unique(
                 patch.remove_test_commands,
                 [cmd for cmd in current_plan.test_commands if self._looks_like_test_target(cmd)],
             )
-            patch.notes = _merge_unique(
-                patch.notes,
-                ["Remove invalid `test` target or replace it with `ctest --test-dir build --output-on-failure` if tests exist."],
-            )
+            add_note("Remove invalid `test` target or replace it with `ctest --output-on-failure` only when tests are configured.")
 
         if "ctest" in text and ("failed" in text or "error" in text):
-            patch.notes = _merge_unique(
-                patch.notes,
-                ["CTest failed; verify whether tests are configured and whether runtime dependencies are installed."],
-            )
+            add_note("CTest failed; verify that tests are actually enabled and runtime dependencies are present.")
 
+        # ---------- linker ----------
         if "undefined reference" in text or "ld:" in text or "linker command failed" in text:
-            patch.notes = _merge_unique(
-                patch.notes,
-                ["Linker failure detected; check missing system libraries or link order."],
-            )
+            add_note("Linker failure detected; check missing system libraries or link order.")
 
-        if any(x in text for x in ["502 bad gateway", "failed to fetch", "repository", "inrelease", "not signed", "certificate verification failed"]):
-            patch.notes = _merge_unique(
-                patch.notes,
-                [
-                    "APT repository/network failure detected.",
-                    "If a mirror is used, prefer HTTP mirror during bootstrap to avoid certificate deadlock.",
-                    "Keep apt steps minimal and re-render Dockerfile instead of adding more packages.",
-                ],
-            )
+        # ---------- APT 网络 ----------
+        if any(
+            x in text
+            for x in [
+                "502 bad gateway",
+                "failed to fetch",
+                "repository",
+                "inrelease",
+                "not signed",
+                "certificate verification failed",
+                "temporary failure resolving",
+                "could not resolve",
+            ]
+        ):
+            add_note("APT repository/network failure detected.")
+            add_note("Prefer HTTP mirror during bootstrap and keep apt steps minimal.")
+            add_note("Re-render Dockerfile with retry settings instead of adding more packages.")
 
-        if "unknown instruction: &&" in text or "dockerfile parse error" in text:
-            patch.notes = _merge_unique(
-                patch.notes,
-                [
-                    "Dockerfile syntax error detected; fix generator line continuation and keep `&&` inside the RUN shell.",
-                ],
-            )
+        # ---------- Qt / Boost / X11 / OpenGL ----------
+        if "could not find boost" in text or "boost_system" in text or "boost_thread" in text or "findpackage(boost" in text:
+            add_pkg("libboost-all-dev")
+
+        if "could not find x11" in text or "findx11.cmake" in text or "missing: x11_x11_include_path" in text or "missing: x11_x11_lib" in text:
+            add_pkg("libx11-dev")
+            add_pkg("libxext-dev")
+            add_pkg("libxrender-dev")
+            add_pkg("libxrandr-dev")
+            add_pkg("libxcursor-dev")
+            add_pkg("libxi-dev")
+            add_pkg("libxkbcommon-x11-dev")
+            add_pkg("libxinerama-dev")
+            add_pkg("libwayland-dev")
+            add_pkg("xorg-dev")
+
+        if "could not find opengl" in text or "could not find glu" in text or "could not find glfw" in text or "could not find glew" in text:
+            add_pkg("libgl1-mesa-dev")
+            add_pkg("libglu1-mesa-dev")
+            add_pkg("libglew-dev")
+            add_pkg("libglfw3-dev")
+
+        if "could not find qt6" in text or "qt6config.cmake" in text or "qt6-config.cmake" in text or "qt6::" in text:
+            add_pkg("qt6-base-dev")
+            add_pkg("qt6-tools-dev")
+            add_pkg("qt6-tools-dev-tools")
+
+        if "could not find qt5" in text or "qt5config.cmake" in text or "qt5-config.cmake" in text:
+            add_pkg("qtbase5-dev")
+            add_pkg("qttools5-dev-tools")
+            add_pkg("qtchooser")
+            add_pkg("qt5-qmake")
+            add_pkg("libqt5svg5-dev")
+            add_pkg("libqt5x11extras5-dev")
+
+        # ---------- 生成器层面的提示 ----------
+        if "copy [" in text or "copy " in text and " /workspace/" in text:
+            add_note("The generator should emit COPY in JSON array form for paths with spaces and subdirectories.")
+        if "source_root_rel" in text and "not found" in text:
+            add_note("Ensure commands are run under the correct source_root_rel and paths are quoted when entering subdirectories.")
 
         return patch
 
@@ -364,19 +490,42 @@ RAG 历史案例参考：
     ):
         from dataclasses import replace
 
+        failure_dict = _to_dict(failure)
+        deps_dict = _to_dict(deps)
+
+        def get_list(d: Dict[str, Any], key: str) -> List[str]:
+            return _as_str_list(d.get(key, []))
+
         new_deps = replace(
             deps,
-            apt_packages=self._merge_str_lists(deps.apt_packages, patch.add_apt_packages, failure.add_apt_packages),
-            pip_packages=self._merge_str_lists(deps.pip_packages, patch.add_pip_packages, failure.add_pip_packages),
-            notes=self._merge_str_lists(deps.notes, patch.notes, failure.suggested_actions, failure.likely_causes),
-            confidence=max(deps.confidence, patch.confidence, failure.confidence),
-            raw={**deps.raw, **patch.raw, **failure.raw},
+            apt_packages=self._merge_str_lists(
+                get_list(deps_dict, "apt_packages"),
+                patch.add_apt_packages,
+                get_list(failure_dict, "add_apt_packages"),
+            ),
+            pip_packages=self._merge_str_lists(
+                get_list(deps_dict, "pip_packages"),
+                patch.add_pip_packages,
+                get_list(failure_dict, "add_pip_packages"),
+            ),
+            notes=self._merge_str_lists(
+                get_list(deps_dict, "notes"),
+                patch.notes,
+                _as_str_list(failure_dict.get("suggested_actions", [])),
+                _as_str_list(failure_dict.get("likely_causes", [])),
+            ),
+            confidence=max(
+                float(getattr(deps, "confidence", 0.0) or 0.0),
+                patch.confidence,
+                float(failure_dict.get("confidence", 0.0) or 0.0),
+            ),
+            raw={**(getattr(deps, "raw", {}) or {}), **patch.raw, **failure_dict},
         )
 
-        new_preinstall = list(plan.preinstall_commands)
-        new_build = list(plan.build_commands)
-        new_test = list(plan.test_commands)
-        new_notes = list(plan.notes)
+        new_preinstall = list(getattr(plan, "preinstall_commands", []) or [])
+        new_build = list(getattr(plan, "build_commands", []) or [])
+        new_test = list(getattr(plan, "test_commands", []) or [])
+        new_notes = list(getattr(plan, "notes", []) or [])
 
         def add_unique(target: List[str], items: List[str]) -> None:
             for item in items:
@@ -407,29 +556,29 @@ RAG 历史案例参考：
                     out.append(cmd)
             return out
 
-        new_base_image = patch.replace_base_image or failure.change_base_image or plan.base_image
+        new_base_image = patch.replace_base_image or str(failure_dict.get("change_base_image", "") or "") or getattr(plan, "base_image", "")
 
-        for pkg in patch.add_apt_packages + failure.add_apt_packages:
+        for pkg in patch.add_apt_packages + _as_str_list(failure_dict.get("add_apt_packages", [])):
             cmd = f"apt-get install -y {pkg}"
             if cmd not in new_preinstall:
                 new_preinstall.append(cmd)
 
-        for pkg in patch.add_pip_packages + failure.add_pip_packages:
+        for pkg in patch.add_pip_packages + _as_str_list(failure_dict.get("add_pip_packages", [])):
             cmd = f"python3 -m pip install --no-cache-dir {pkg}"
             if cmd not in new_preinstall:
                 new_preinstall.append(cmd)
 
         add_unique(new_preinstall, patch.add_preinstall_commands)
         add_unique(new_build, patch.add_build_commands)
-        add_unique(new_build, failure.update_build_commands)
+        add_unique(new_build, _as_str_list(failure_dict.get("update_build_commands", [])))
         add_unique(new_test, patch.add_test_commands)
 
         new_build = remove_matching(new_build, patch.remove_build_commands)
         new_test = remove_matching(new_test, patch.remove_test_commands)
 
         add_unique(new_notes, patch.notes)
-        add_unique(new_notes, failure.suggested_actions)
-        add_unique(new_notes, failure.likely_causes)
+        add_unique(new_notes, _as_str_list(failure_dict.get("suggested_actions", [])))
+        add_unique(new_notes, _as_str_list(failure_dict.get("likely_causes", [])))
 
         new_plan = replace(
             plan,
@@ -438,8 +587,12 @@ RAG 历史案例参考：
             build_commands=new_build,
             test_commands=new_test,
             notes=new_notes,
-            confidence=max(plan.confidence, patch.confidence, failure.confidence),
-            raw={**plan.raw, **patch.raw, **failure.raw},
+            confidence=max(
+                float(getattr(plan, "confidence", 0.0) or 0.0),
+                patch.confidence,
+                float(failure_dict.get("confidence", 0.0) or 0.0),
+            ),
+            raw={**(getattr(plan, "raw", {}) or {}), **patch.raw, **failure_dict},
         )
 
         return new_plan, new_deps
@@ -457,9 +610,7 @@ RAG 历史案例参考：
 
             for item in seq:
                 s = str(item).strip()
-                if not s:
-                    continue
-                if s in seen:
+                if not s or s in seen:
                     continue
                 seen.add(s)
                 out.append(s)

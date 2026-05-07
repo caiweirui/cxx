@@ -1,0 +1,9 @@
+project/polybar
+project/simdjson
+project/raylib
+project/flameshot
+project/rnnoise
+project/crow
+project/aubio
+project/oatpp
+project/mold

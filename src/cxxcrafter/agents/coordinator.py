@@ -35,12 +35,17 @@ class ProjectSnapshot:
     project_name: str
     source_root_rel: str
     build_system: str
+
     has_cmakelists: bool = False
     has_makefile: bool = False
+    has_autotools: bool = False
+    has_meson: bool = False
+
     has_package_json: bool = False
     has_pyproject: bool = False
     has_requirements: bool = False
     has_dockerfile: bool = False
+
     files_sample: List[str] = field(default_factory=list)
     rule_apt_packages: List[str] = field(default_factory=list)
     rule_pip_packages: List[str] = field(default_factory=list)
@@ -48,20 +53,22 @@ class ProjectSnapshot:
     rule_cmake_args: List[str] = field(default_factory=list)
     rule_notes: List[str] = field(default_factory=list)
 
+    required_cmake_version: Optional[str] = None
+    requires_qt6: bool = False
+    requires_boost: bool = False
+    requires_x11: bool = False
+    requires_opengl: bool = False
+    has_tests: bool = False
+    is_gui_project: bool = False
+
 class CXXCrafterCoordinator:
     """
     轻多智能体重构版：
     - 规则层做硬判断
     - DependencyAgent / BuildAgent / ErrorAgent / RepairAgent 负责分析与修复
     - DockerfileGenerator 确定性渲染
-    - ErrorAgent / RepairAgent 负责修复闭环
     - build / verify 增加明确状态与超时控制
     - 成功后可回写 RAG 知识库
-
-    增强点：
-    - agent 使用日志
-    - RAG 命中日志
-    - summary 记录 agent / rag / trace
     """
 
     def __init__(
@@ -102,11 +109,13 @@ class CXXCrafterCoordinator:
         build_timeout_seconds: Optional[float] = 1800,
         verify_timeout_seconds: Optional[float] = 600,
         project_timeout_seconds: Optional[float] = None,
+        failure_log_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         project_path = str(Path(project_path).resolve())
         output_dir = str(Path(output_dir).resolve())
         log_dir = str(Path(log_dir).resolve())
 
+        project_timeout_seconds = self._normalize_optional_timeout(project_timeout_seconds)
         started_at = time.monotonic()
 
         snapshot = self._snapshot_project(project_path)
@@ -126,7 +135,6 @@ class CXXCrafterCoordinator:
             else DockerfileGenerator(project_path)
         )
 
-        # 规则层基础依赖
         dep_seed = self._rule_dependency_seed(snapshot)
         snapshot.rule_apt_packages = dep_seed["apt_packages"]
         snapshot.rule_pip_packages = dep_seed["pip_packages"]
@@ -134,7 +142,6 @@ class CXXCrafterCoordinator:
         snapshot.rule_cmake_args = dep_seed["cmake_args"]
         snapshot.rule_notes = dep_seed["notes"]
 
-        # 运行时诊断：agent / rag 基线信息
         agent_usage = self._build_agent_usage_report()
         rag_usage = self._init_rag_usage_report()
         execution_trace: List[Dict[str, Any]] = []
@@ -147,7 +154,6 @@ class CXXCrafterCoordinator:
         self._print_agent_usage_banner(agent_usage)
         self._print_rag_banner(rag_usage)
 
-        # 1) 依赖分析
         dep_analysis, dep_elapsed = self._timed_call(
             "dependency_agent.analyze",
             self.dependency_agent.analyze,
@@ -155,13 +161,11 @@ class CXXCrafterCoordinator:
         )
         dep_analysis = self._coerce_output(DependencyAnalysis, dep_analysis)
         execution_trace.append(self._trace_event("dependency_agent.analyze", dep_elapsed, success=True))
-
         self._append_agent_call(agent_usage, "dependency_agent", "analyze", dep_elapsed, dep_analysis)
         self._record_rag_usage_from_object(rag_usage, "dependency_analysis", dep_analysis)
 
         current_dep_analysis = dep_analysis
 
-        # 2) 构建计划
         build_plan, build_plan_elapsed = self._timed_call(
             "build_agent.plan",
             self.build_agent.plan,
@@ -178,17 +182,42 @@ class CXXCrafterCoordinator:
         )
         build_plan = self._coerce_output(BuildPlan, build_plan)
         execution_trace.append(self._trace_event("build_agent.plan", build_plan_elapsed, success=True))
-
         self._append_agent_call(agent_usage, "build_agent", "plan", build_plan_elapsed, build_plan)
         self._record_rag_usage_from_object(rag_usage, "build_plan", build_plan)
 
         current_plan = build_plan
 
-        # 3) 确定性生成 Dockerfile
+        debug_render_context = {
+            "project_name": snapshot.project_name,
+            "build_system": snapshot.build_system,
+            "source_root_rel": snapshot.source_root_rel,
+            "has_cmakelists": snapshot.has_cmakelists,
+            "has_makefile": snapshot.has_makefile,
+            "has_autotools": snapshot.has_autotools,
+            "has_meson": snapshot.has_meson,
+            "required_cmake_version": snapshot.required_cmake_version,
+            "requires_qt6": snapshot.requires_qt6,
+            "requires_boost": snapshot.requires_boost,
+            "requires_x11": snapshot.requires_x11,
+            "requires_opengl": snapshot.requires_opengl,
+            "has_tests": snapshot.has_tests,
+            "is_gui_project": snapshot.is_gui_project,
+            "copy_paths": list(getattr(current_plan, "copy_paths", []) or []),
+            "workdir": getattr(current_plan, "workdir", None),
+            "base_image": getattr(current_plan, "base_image", None),
+            "build_commands": list(getattr(current_plan, "build_commands", []) or []),
+            "test_commands": list(getattr(current_plan, "test_commands", []) or []),
+            "runtime_command": getattr(current_plan, "runtime_command", None),
+        }
+
+        print("[Debug] Render Context:")
+        for k, v in debug_render_context.items():
+            print(f"  - {k:20s}: {v}")
+        print()
+
         dockerfile_text = generator.render(current_dep_analysis, current_plan, asdict(snapshot))
         dockerfile_path = generator.save(dockerfile_text, dockerfile_path)
 
-        # 4) 仅生成模式：直接返回
         if generate_only or (not enable_build and not enable_verification):
             summary = self._make_summary(
                 snapshot=snapshot,
@@ -219,6 +248,7 @@ class CXXCrafterCoordinator:
                 agent_usage=agent_usage,
                 rag_usage=rag_usage,
                 execution_trace=execution_trace,
+                render_context=debug_render_context,
             )
             summary["rag_recorded"] = False
             summary["rag_record_type"] = "none"
@@ -227,7 +257,6 @@ class CXXCrafterCoordinator:
             self._print_final_summary(snapshot.project_name, summary)
             return summary
 
-        # 如果禁用 build，则无法做 verification，直接视为生成完成
         if not enable_build:
             summary = self._make_summary(
                 snapshot=snapshot,
@@ -258,6 +287,7 @@ class CXXCrafterCoordinator:
                 agent_usage=agent_usage,
                 rag_usage=rag_usage,
                 execution_trace=execution_trace,
+                render_context=debug_render_context,
             )
             summary["rag_recorded"] = False
             summary["rag_record_type"] = "none"
@@ -266,7 +296,6 @@ class CXXCrafterCoordinator:
             self._print_final_summary(snapshot.project_name, summary)
             return summary
 
-        # 5) 构建 / 验证 / 修复闭环
         current_dockerfile = dockerfile_path
         current_text = dockerfile_text
 
@@ -363,8 +392,32 @@ class CXXCrafterCoordinator:
             if build_dict.get("success", False):
                 print("✅ 构建完成")
 
-                # build 成功后，进入多维度验证
                 if enable_verification:
+                    if self._should_skip_verification(snapshot, current_plan, current_dep_analysis):
+                        final_verification_result = {
+                            "success": False,
+                            "status": "skipped",
+                            "skipped": True,
+                            "message": "verification skipped for non-runtime / test-only project",
+                            "final_verdict": {
+                                "verdict": "skipped",
+                                "confidence": 0.0,
+                                "reason": "non-runtime or test-only project",
+                            },
+                        }
+                        attempt_record["status"] = "build_passed_verification_skipped"
+                        attempt_record["verification_result"] = final_verification_result
+                        attempt_history.append(attempt_record)
+                        execution_trace.append(
+                            self._trace_event(
+                                "verification_skipped",
+                                0.0,
+                                success=True,
+                                extra={"reason": "non-runtime or test-only project"},
+                            )
+                        )
+                        break
+
                     judge = self._get_verification_judge()
                     if judge is None:
                         final_verification_result = {
@@ -464,12 +517,24 @@ class CXXCrafterCoordinator:
                         )
                     )
 
+                    repair_payload = self._build_repair_failure_payload(
+                        snapshot=snapshot,
+                        current_plan=current_plan,
+                        failure=failure,
+                        log_source=failure_source,
+                        dockerfile_text=current_text,
+                        build_log_path=build_log_path,
+                        verify_log_path=verify_log_path,
+                        stage="verification",
+                        attempt_idx=attempt_idx,
+                    )
+
                     patch, repair_elapsed = self._timed_call(
                         "repair_agent.suggest_patch",
                         self.repair_agent.suggest_patch,
                         snapshot=asdict(snapshot),
                         current_plan=current_plan,
-                        failure=asdict(failure),
+                        failure=repair_payload,
                     )
                     patch = self._coerce_output(RepairPatch, patch)
                     self._append_agent_call(agent_usage, "repair_agent", "suggest_patch", repair_elapsed, patch)
@@ -488,7 +553,6 @@ class CXXCrafterCoordinator:
                         dockerfile_text=current_text,
                         current_plan=current_plan,
                     )
-
                     merged_patch = self._merge_patches(patch, heuristic_patch)
 
                     current_plan, current_dep_analysis = self._apply_patch(
@@ -501,7 +565,6 @@ class CXXCrafterCoordinator:
                     current_dockerfile = generator.save(current_text, dockerfile_path)
                     continue
 
-                # build 成功且不需要验证
                 final_verification_result = {
                     "success": False,
                     "status": "skipped",
@@ -526,7 +589,6 @@ class CXXCrafterCoordinator:
                 )
                 break
 
-            # build 失败：记录并尝试修复
             print("❌ 构建失败")
             attempt_record["status"] = "build_failed"
             attempt_history.append(attempt_record)
@@ -554,12 +616,24 @@ class CXXCrafterCoordinator:
                 )
             )
 
+            repair_payload = self._build_repair_failure_payload(
+                snapshot=snapshot,
+                current_plan=current_plan,
+                failure=failure,
+                log_source=failure_source,
+                dockerfile_text=current_text,
+                build_log_path=build_log_path,
+                verify_log_path=verify_log_path,
+                stage="build",
+                attempt_idx=attempt_idx,
+            )
+
             patch, repair_elapsed = self._timed_call(
                 "repair_agent.suggest_patch",
                 self.repair_agent.suggest_patch,
                 snapshot=asdict(snapshot),
                 current_plan=current_plan,
-                failure=asdict(failure),
+                failure=repair_payload,
             )
             patch = self._coerce_output(RepairPatch, patch)
             self._append_agent_call(agent_usage, "repair_agent", "suggest_patch", repair_elapsed, patch)
@@ -578,7 +652,6 @@ class CXXCrafterCoordinator:
                 dockerfile_text=current_text,
                 current_plan=current_plan,
             )
-
             merged_patch = self._merge_patches(patch, heuristic_patch)
 
             current_plan, current_dep_analysis = self._apply_patch(
@@ -590,7 +663,6 @@ class CXXCrafterCoordinator:
             current_text = generator.render(current_dep_analysis, current_plan, asdict(snapshot))
             current_dockerfile = generator.save(current_text, dockerfile_path)
 
-        # 6) 最终汇总
         attempts_used = len(attempt_history)
         repair_round_used = max(0, attempts_used - 1)
 
@@ -622,7 +694,6 @@ class CXXCrafterCoordinator:
             overall_status = "timeout"
             success = False
 
-        # 汇总 rag / agent / trace
         self._finalize_rag_usage(rag_usage)
         summary = self._make_summary(
             snapshot=snapshot,
@@ -639,11 +710,22 @@ class CXXCrafterCoordinator:
             agent_usage=agent_usage,
             rag_usage=rag_usage,
             execution_trace=execution_trace,
+            render_context=debug_render_context,
         )
 
-        # ============================================================
-        # 成功后回写 RAG（只在真实 build + verification 成功时回写）
-        # ============================================================
+        if not bool(final_build_result.get("success", False)):
+            self._append_failure_log(
+                failure_log_path=failure_log_path,
+                snapshot=snapshot,
+                overall_status=overall_status,
+                dockerfile_path=current_dockerfile,
+                build_result=final_build_result,
+                verification_result=final_verification_result,
+                build_log_path=build_log_path,
+                verify_log_path=verify_log_path,
+                attempt_history=attempt_history,
+            )
+
         rag_recorded = self._maybe_record_success_case(
             snapshot=snapshot,
             dep_analysis=current_dep_analysis,
@@ -670,6 +752,8 @@ class CXXCrafterCoordinator:
 
         has_cmakelists = False
         has_makefile = False
+        has_autotools = False
+        has_meson = False
         has_package_json = False
         has_pyproject = False
         has_requirements = False
@@ -680,31 +764,95 @@ class CXXCrafterCoordinator:
         build_system = "unknown"
 
         cmake_candidates = []
+        make_candidates = []
+        autotools_candidates = []
+        meson_candidates = []
+
         for p in root.rglob("*"):
             if len(files_sample) < 120 and p.is_file():
                 files_sample.append(str(p.relative_to(root)))
 
-            if p.name == "CMakeLists.txt":
+            name = p.name
+            low_name = name.lower()
+
+            if name == "CMakeLists.txt":
                 has_cmakelists = True
                 cmake_candidates.append(p.parent)
-            elif p.name in ("Makefile", "makefile"):
+            elif name in ("Makefile", "makefile"):
                 has_makefile = True
-            elif p.name == "package.json":
+                make_candidates.append(p.parent)
+            elif name in ("configure.ac", "configure.in") or low_name == "autogen.sh":
+                has_autotools = True
+                autotools_candidates.append(p.parent)
+            elif name == "meson.build":
+                has_meson = True
+                meson_candidates.append(p.parent)
+            elif name == "package.json":
                 has_package_json = True
-            elif p.name == "pyproject.toml":
+            elif name == "pyproject.toml":
                 has_pyproject = True
-            elif p.name == "requirements.txt":
+            elif name == "requirements.txt":
                 has_requirements = True
-            elif p.name.lower() == "dockerfile":
+            elif low_name == "dockerfile":
                 has_dockerfile = True
+
+        required_cmake_version = None
+        requires_qt6 = False
+        requires_boost = False
+        requires_x11 = False
+        requires_opengl = False
+        has_tests = False
+        is_gui_project = False
 
         if has_cmakelists:
             build_system = "cmake"
             cmake_dir = sorted(cmake_candidates, key=lambda p: len(str(p).split(os.sep)))[0]
             source_root_rel = str(cmake_dir.relative_to(root)) if cmake_dir != root else "."
+            cmake_file = cmake_dir / "CMakeLists.txt"
+            cmake_text = self._read_text_file(cmake_file)
+            low = cmake_text.lower()
+
+            required_cmake_version = self._extract_cmake_min_version(cmake_text)
+            requires_qt6 = ("find_package(qt6" in low) or ("qt6::" in low)
+            requires_boost = ("find_package(boost" in low) or ("boost::" in low)
+            requires_x11 = ("find_package(x11" in low) or ("x11::" in low) or ("x11 " in low)
+            requires_opengl = (
+                ("find_package(opengl" in low)
+                or ("find_package(glu" in low)
+                or ("find_package(glfw" in low)
+                or ("find_package(glew" in low)
+                or ("opengl" in low and "find_package" in low)
+            )
+            has_tests = ("enable_testing(" in low) or ("add_test(" in low) or ("ctest" in low)
+            is_gui_project = any(
+                token in low
+                for token in [
+                    "qt",
+                    "gtk",
+                    "wxwidgets",
+                    "glfw",
+                    "sdl2",
+                    "opengl",
+                    "x11",
+                    "gui",
+                    "desktop",
+                    "window",
+                    "wayland",
+                    "xcb",
+                ]
+            ) or requires_qt6
+        elif has_meson:
+            build_system = "meson"
+            meson_dir = sorted(meson_candidates, key=lambda p: len(str(p).split(os.sep)))[0]
+            source_root_rel = str(meson_dir.relative_to(root)) if meson_dir != root else "."
+        elif has_autotools:
+            build_system = "autotools"
+            auto_dir = sorted(autotools_candidates, key=lambda p: len(str(p).split(os.sep)))[0]
+            source_root_rel = str(auto_dir.relative_to(root)) if auto_dir != root else "."
         elif has_makefile:
             build_system = "make"
-            source_root_rel = "."
+            make_dir = sorted(make_candidates, key=lambda p: len(str(p).split(os.sep)))[0]
+            source_root_rel = str(make_dir.relative_to(root)) if make_dir != root else "."
         elif has_package_json:
             build_system = "node"
             source_root_rel = "."
@@ -719,11 +867,20 @@ class CXXCrafterCoordinator:
             build_system=build_system,
             has_cmakelists=has_cmakelists,
             has_makefile=has_makefile,
+            has_autotools=has_autotools,
+            has_meson=has_meson,
             has_package_json=has_package_json,
             has_pyproject=has_pyproject,
             has_requirements=has_requirements,
             has_dockerfile=has_dockerfile,
             files_sample=files_sample,
+            required_cmake_version=required_cmake_version,
+            requires_qt6=requires_qt6,
+            requires_boost=requires_boost,
+            requires_x11=requires_x11,
+            requires_opengl=requires_opengl,
+            has_tests=has_tests,
+            is_gui_project=is_gui_project,
         )
 
     def _rule_dependency_seed(self, snapshot: ProjectSnapshot) -> Dict[str, Any]:
@@ -737,9 +894,62 @@ class CXXCrafterCoordinator:
             apt_packages += ["cmake", "build-essential", "ninja-build", "pkg-config"]
             cmake_args += ["-DCMAKE_BUILD_TYPE=Release"]
             notes.append("Detected CMake project")
+            notes.append(f"CMake source root: {snapshot.source_root_rel}")
+            if snapshot.required_cmake_version:
+                notes.append(f"Required CMake version: {snapshot.required_cmake_version}")
+            if snapshot.requires_qt6:
+                notes.append("Qt6 detected from CMakeLists.txt")
+            if snapshot.requires_boost:
+                notes.append("Boost detected from CMakeLists.txt")
+            if snapshot.requires_x11:
+                notes.append("X11 detected from CMakeLists.txt")
+            if snapshot.requires_opengl:
+                notes.append("OpenGL/GLFW/GLEW detected from CMakeLists.txt")
+            if snapshot.is_gui_project:
+                notes.append("Detected GUI/desktop project")
+
+            if snapshot.requires_boost:
+                apt_packages += ["libboost-all-dev"]
+
+            if snapshot.requires_x11 or snapshot.is_gui_project:
+                apt_packages += [
+                    "libx11-dev",
+                    "libxext-dev",
+                    "libxrender-dev",
+                    "libxrandr-dev",
+                    "libxcursor-dev",
+                    "libxi-dev",
+                    "libxkbcommon-x11-dev",
+                    "libwayland-dev",
+                ]
+
+            if snapshot.requires_opengl or snapshot.is_gui_project:
+                apt_packages += [
+                    "libgl1-mesa-dev",
+                    "libglu1-mesa-dev",
+                    "libglew-dev",
+                    "libglfw3-dev",
+                ]
+
+            if snapshot.requires_qt6:
+                apt_packages += [
+                    "qt6-base-dev",
+                    "qt6-tools-dev",
+                    "qt6-tools-dev-tools",
+                ]
+
+        elif snapshot.build_system == "meson":
+            apt_packages += ["meson", "ninja-build", "pkg-config", "build-essential"]
+            notes.append("Detected Meson project")
+            notes.append(f"Meson source root: {snapshot.source_root_rel}")
+        elif snapshot.build_system == "autotools":
+            apt_packages += ["autoconf", "automake", "libtool", "pkg-config", "build-essential"]
+            notes.append("Detected Autotools project")
+            notes.append(f"Autotools source root: {snapshot.source_root_rel}")
         elif snapshot.build_system == "make":
             apt_packages += ["build-essential", "make", "pkg-config"]
             notes.append("Detected Makefile project")
+            notes.append(f"Make source root: {snapshot.source_root_rel}")
         elif snapshot.build_system == "node":
             apt_packages += ["nodejs", "npm"]
             notes.append("Detected Node project")
@@ -785,10 +995,6 @@ class CXXCrafterCoordinator:
         }
 
     def _extract_agent_config(self, agent: Any) -> Dict[str, Any]:
-        """
-        从 agent 实例中尽可能提取当前有效配置。
-        不依赖具体实现，只做容错式读取。
-        """
         if agent is None:
             return {}
 
@@ -803,7 +1009,6 @@ class CXXCrafterCoordinator:
                 pass
 
         def pick(*names: str) -> Any:
-            # 先看 agent 本体
             for name in names:
                 try:
                     if hasattr(agent, name):
@@ -812,7 +1017,7 @@ class CXXCrafterCoordinator:
                             return v
                 except Exception:
                     pass
-            # 再看嵌套 config
+
             if candidate_cfg is not None:
                 if isinstance(candidate_cfg, dict):
                     for name in names:
@@ -897,13 +1102,6 @@ class CXXCrafterCoordinator:
                 print(f"[RAG][{stage}] 未检测到显式 rag_docs_context，但 RAG 服务处于启用状态。\n")
 
     def _extract_rag_context(self, obj: Any) -> Dict[str, Any]:
-        """
-        从 dataclass / dict / 普通对象中提取 rag 证据。
-        重点找：
-        - raw.rag_docs_context
-        - rag_docs_context
-        - rag_context
-        """
         payload = self._to_dict(obj)
         raw = payload.get("raw", {}) if isinstance(payload, dict) else {}
 
@@ -980,7 +1178,7 @@ class CXXCrafterCoordinator:
         for item in candidates[:max_items]:
             item = item.replace("\t", " ")
             if len(item) > max_len:
-                item = item[:max_len - 3] + "..."
+                item = item[: max_len - 3] + "..."
             previews.append(item)
         return previews
 
@@ -1014,7 +1212,6 @@ class CXXCrafterCoordinator:
                 if key in payload:
                     summary[key] = payload[key]
 
-            # 额外记录一些对排查有用的字段
             for key in ("message", "reason", "final_verdict"):
                 if key in payload:
                     summary[key] = payload[key]
@@ -1026,7 +1223,6 @@ class CXXCrafterCoordinator:
                     summary["rag_context_length"] = len(str(raw.get("rag_docs_context", "")))
                 if "notes" in raw:
                     summary["raw_notes"] = raw.get("notes")
-
         else:
             summary["type"] = type(result).__name__
 
@@ -1062,9 +1258,6 @@ class CXXCrafterCoordinator:
         enable_build: bool,
         enable_verification: bool,
     ) -> bool:
-        """
-        只在真实 build + verification 成功时回写成功案例。
-        """
         if self.rag_service is None:
             return False
 
@@ -1189,6 +1382,11 @@ class CXXCrafterCoordinator:
             if note and note not in patch.notes:
                 patch.notes.append(note)
 
+        def add_pre(cmd: str) -> None:
+            if cmd and cmd not in patch.add_preinstall_commands:
+                patch.add_preinstall_commands.append(cmd)
+
+        # APT / 网络
         if any(
             s in low
             for s in [
@@ -1206,6 +1404,7 @@ class CXXCrafterCoordinator:
             if "apt_source_mirror" not in dockerfile_text.lower() and "acquire::retries" not in dockerfile_text.lower():
                 add_note("Re-render Dockerfile with mirrored apt sources and retry settings.")
 
+        # 工具缺失
         if re.search(r"(cmake: command not found|cmake.*not found)", low):
             add_apt("cmake")
         if re.search(r"(ninja: command not found|ninja-build.*not found)", low):
@@ -1221,19 +1420,85 @@ class CXXCrafterCoordinator:
             add_apt("python3-pip")
             add_apt("python3-venv")
 
+        # Boost / X11 / OpenGL / Qt
+        if "could not find boost" in low or "boost_include_dir" in low or "boost_system" in low or "boost_thread" in low:
+            add_apt("libboost-all-dev")
+
+        if "could not find x11" in low or "findx11.cmake" in low or "missing: x11_x11_include_path" in low or "missing: x11_x11_lib" in low:
+            add_apt("libx11-dev")
+            add_apt("libxext-dev")
+            add_apt("libxrender-dev")
+            add_apt("libxrandr-dev")
+            add_apt("libxcursor-dev")
+            add_apt("libxi-dev")
+            add_apt("libxkbcommon-x11-dev")
+            add_apt("libxinerama-dev")
+            add_apt("libwayland-dev")
+            add_apt("xorg-dev")
+
+        if "could not find opengl" in low or "could not find glu" in low or "could not find glfw" in low or "could not find glew" in low:
+            add_apt("libgl1-mesa-dev")
+            add_apt("libglu1-mesa-dev")
+            add_apt("libglew-dev")
+            add_apt("libglfw3-dev")
+
+        if "could not find qt6" in low or "qt6config.cmake" in low or "qt6-config.cmake" in low or "qt6::" in low:
+            add_apt("qt6-base-dev")
+            add_apt("qt6-tools-dev")
+            add_apt("qt6-tools-dev-tools")
+
+        if "could not find qt5" in low or "qt5config.cmake" in low or "qt5-config.cmake" in low:
+            add_apt("qtbase5-dev")
+            add_apt("qttools5-dev-tools")
+            add_apt("qtchooser")
+            add_apt("qt5-qmake")
+            add_apt("libqt5svg5-dev")
+            add_apt("libqt5x11extras5-dev")
+
+        # 本次最关键：COPY / 路径 / source_root
+        if any(
+            s in low
+            for s in [
+                "failed to calculate checksum",
+                "copy failed",
+                "copy [",
+                "not found",
+                "/workspace/test",
+                "cannot stat",
+                "can't stat",
+            ]
+        ) and ("copy" in low or "dockerfile" in low or "/workspace/" in low):
+            add_note("Docker COPY/path failure detected. Generate COPY with JSON-array syntax and keep source_root_rel as quoted relative path.")
+            add_note("Do not concatenate paths with spaces into a plain `COPY a b` form.")
+            add_note("If the project root is a subdirectory, ensure commands cd into source_root_rel before building.")
+
+        # 本次最关键：autotools 的 CRLF / bad interpreter
+        if any(
+            s in low
+            for s in [
+                "bad interpreter",
+                "/bin/sh^m",
+                "carriage return",
+                "crlf",
+                "dos line endings",
+                "mismatched shebang",
+            ]
+        ):
+            add_pre(r"sed -i 's/\r$//' ./autogen.sh ./configure 2>/dev/null || true")
+            add_pre(r"chmod +x ./autogen.sh ./configure 2>/dev/null || true")
+            add_note("CRLF / bad interpreter detected; normalize autogen.sh/configure line endings before running autotools scripts.")
+
         if "no rule to make target 'test'" in low or 'no rule to make target "test"' in low or "target 'test' not found" in low:
             bad_tests = [cmd for cmd in current_plan.test_commands if self._looks_like_test_target(cmd)]
             patch.remove_test_commands = self._merge_str_lists(patch.remove_test_commands, bad_tests)
-            add_note("Remove invalid test target; use ctest only if tests are configured.")
+            add_note("Remove invalid `test` target or replace it with `ctest --output-on-failure` only when tests are configured.")
 
         if "ctest" in low and ("failed" in low or "error" in low):
-            add_note("CTest failed; check whether tests are actually enabled and runtime dependencies are installed.")
+            add_note("CTest failed; verify that tests are actually enabled and runtime dependencies are present.")
 
         if "undefined reference" in low or "ld:" in low or "linker command failed" in low:
             add_note("Linker failure detected; missing system libraries or wrong link order may be the cause.")
 
-        patch.add_apt_packages = self._merge_str_lists(patch.add_apt_packages, [])
-        patch.notes = self._merge_str_lists(patch.notes, [])
         return patch
 
     @staticmethod
@@ -1272,17 +1537,38 @@ class CXXCrafterCoordinator:
     ) -> Tuple[BuildPlan, DependencyAnalysis]:
         new_deps = replace(
             deps,
-            apt_packages=self._merge_str_lists(deps.apt_packages, patch.add_apt_packages, failure.add_apt_packages),
-            pip_packages=self._merge_str_lists(deps.pip_packages, patch.add_pip_packages, failure.add_pip_packages),
-            notes=self._merge_str_lists(deps.notes, patch.notes, failure.suggested_actions, failure.likely_causes),
-            confidence=max(deps.confidence, patch.confidence, failure.confidence),
-            raw={**deps.raw, **patch.raw, **failure.raw},
+            apt_packages=self._merge_str_lists(
+                deps.apt_packages,
+                patch.add_apt_packages,
+                getattr(failure, "add_apt_packages", []),
+            ),
+            pip_packages=self._merge_str_lists(
+                deps.pip_packages,
+                patch.add_pip_packages,
+                getattr(failure, "add_pip_packages", []),
+            ),
+            notes=self._merge_str_lists(
+                deps.notes,
+                patch.notes,
+                getattr(failure, "suggested_actions", []),
+                getattr(failure, "likely_causes", []),
+            ),
+            confidence=max(
+                deps.confidence,
+                patch.confidence,
+                getattr(failure, "confidence", 0.0),
+            ),
+            raw={
+                **(getattr(deps, "raw", {}) or {}),
+                **patch.raw,
+                **(getattr(failure, "raw", {}) or {}),
+            },
         )
 
-        new_preinstall = list(plan.preinstall_commands)
-        new_build = list(plan.build_commands)
-        new_test = list(plan.test_commands)
-        new_notes = list(plan.notes)
+        new_preinstall = list(getattr(plan, "preinstall_commands", []) or [])
+        new_build = list(getattr(plan, "build_commands", []) or [])
+        new_test = list(getattr(plan, "test_commands", []) or [])
+        new_notes = list(getattr(plan, "notes", []) or [])
 
         def add_unique(target: List[str], items: List[str]) -> None:
             for item in items:
@@ -1313,29 +1599,33 @@ class CXXCrafterCoordinator:
                     out.append(cmd)
             return out
 
-        new_base_image = patch.replace_base_image or failure.change_base_image or plan.base_image
+        new_base_image = (
+            patch.replace_base_image
+            or getattr(failure, "change_base_image", "")
+            or plan.base_image
+        )
 
-        for pkg in patch.add_apt_packages + failure.add_apt_packages:
+        for pkg in patch.add_apt_packages + self._as_list(getattr(failure, "add_apt_packages", [])):
             cmd = f"apt-get install -y {pkg}"
             if cmd not in new_preinstall:
                 new_preinstall.append(cmd)
 
-        for pkg in patch.add_pip_packages + failure.add_pip_packages:
+        for pkg in patch.add_pip_packages + self._as_list(getattr(failure, "add_pip_packages", [])):
             cmd = f"python3 -m pip install --no-cache-dir {pkg}"
             if cmd not in new_preinstall:
                 new_preinstall.append(cmd)
 
         add_unique(new_preinstall, patch.add_preinstall_commands)
         add_unique(new_build, patch.add_build_commands)
-        add_unique(new_build, failure.update_build_commands)
+        add_unique(new_build, self._as_list(getattr(failure, "update_build_commands", [])))
         add_unique(new_test, patch.add_test_commands)
 
         new_build = remove_matching(new_build, patch.remove_build_commands)
         new_test = remove_matching(new_test, patch.remove_test_commands)
 
         add_unique(new_notes, patch.notes)
-        add_unique(new_notes, failure.suggested_actions)
-        add_unique(new_notes, failure.likely_causes)
+        add_unique(new_notes, self._as_list(getattr(failure, "suggested_actions", [])))
+        add_unique(new_notes, self._as_list(getattr(failure, "likely_causes", [])))
 
         new_plan = replace(
             plan,
@@ -1344,8 +1634,16 @@ class CXXCrafterCoordinator:
             build_commands=new_build,
             test_commands=new_test,
             notes=new_notes,
-            confidence=max(plan.confidence, patch.confidence, failure.confidence),
-            raw={**plan.raw, **patch.raw, **failure.raw},
+            confidence=max(
+                plan.confidence,
+                patch.confidence,
+                getattr(failure, "confidence", 0.0),
+            ),
+            raw={
+                **(getattr(plan, "raw", {}) or {}),
+                **patch.raw,
+                **(getattr(failure, "raw", {}) or {}),
+            },
         )
 
         return new_plan, new_deps
@@ -1373,6 +1671,165 @@ class CXXCrafterCoordinator:
         return out
 
     # -------------------------
+    # 失败上下文打包（新增）
+    # -------------------------
+    def _build_repair_failure_payload(
+        self,
+        snapshot: ProjectSnapshot,
+        current_plan: BuildPlan,
+        failure: FailureAnalysis,
+        log_source: str,
+        dockerfile_text: str,
+        build_log_path: str,
+        verify_log_path: str,
+        stage: str,
+        attempt_idx: int,
+    ) -> Dict[str, Any]:
+        failure_dict = self._to_dict(failure)
+
+        failure_raw = failure_dict.get("raw", {})
+        if not isinstance(failure_raw, dict):
+            failure_raw = {}
+
+        return {
+            **failure_dict,
+            "stage": stage,
+            "attempt_idx": attempt_idx,
+            "project_name": snapshot.project_name,
+            "project_path": snapshot.project_path,
+            "build_system": snapshot.build_system,
+            "source_root_rel": snapshot.source_root_rel,
+            "current_plan": self._to_dict(current_plan),
+            "dockerfile_text": dockerfile_text,
+            "build_log": log_source,
+            "build_log_excerpt": self._excerpt(log_source, 8000),
+            "build_log_path": build_log_path,
+            "verify_log_path": verify_log_path,
+            "copy_paths": list(getattr(current_plan, "copy_paths", []) or []),
+            "workdir": getattr(current_plan, "workdir", None),
+            "base_image": getattr(current_plan, "base_image", None),
+            "build_commands": list(getattr(current_plan, "build_commands", []) or []),
+            "test_commands": list(getattr(current_plan, "test_commands", []) or []),
+            "runtime_command": getattr(current_plan, "runtime_command", None),
+            "snapshot": asdict(snapshot),
+            "raw": {
+                **failure_raw,
+                "build_log": log_source,
+                "build_log_excerpt": self._excerpt(log_source, 8000),
+                "dockerfile_text": dockerfile_text,
+            },
+        }    
+
+    def _excerpt(self, text: str, max_chars: int = 4000) -> str:
+        text = text or ""
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n...[truncated]..."
+
+    def _to_dict(self, obj: Any) -> Dict[str, Any]:
+        if obj is None:
+            return {}
+        if isinstance(obj, dict):
+            return obj
+        if is_dataclass(obj):
+            return asdict(obj)
+        if hasattr(obj, "__dict__"):
+            try:
+                return dict(obj.__dict__)
+            except Exception:
+                return {}
+        return {}
+
+    def _as_list(self, value: Any) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [str(x) for x in value if str(x).strip()]
+        if isinstance(value, tuple):
+            return [str(x) for x in value if str(x).strip()]
+        if isinstance(value, set):
+            return [str(x) for x in value if str(x).strip()]
+        return [str(value)] if str(value).strip() else []
+
+    # -------------------------
+    # 失败汇总日志
+    # -------------------------
+    def _append_failure_log(
+        self,
+        failure_log_path: Optional[str],
+        snapshot: ProjectSnapshot,
+        overall_status: str,
+        dockerfile_path: str,
+        build_result: Dict[str, Any],
+        verification_result: Dict[str, Any],
+        build_log_path: str,
+        verify_log_path: str,
+        attempt_history: List[Dict[str, Any]],
+    ) -> None:
+        if not failure_log_path:
+            return
+
+        try:
+            path = Path(failure_log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            log_source = build_result.get("log_path") or build_log_path
+            build_log_text = self._read_text_file(log_source)
+            verify_log_text = self._read_text_file(verification_result.get("log_path") or verify_log_path)
+
+            def _excerpt(text: str, max_chars: int = 3000) -> str:
+                if not text:
+                    return ""
+                text = text.strip()
+                if len(text) <= max_chars:
+                    return text
+                return text[:max_chars] + "\n...[truncated]..."
+
+            last_attempt = attempt_history[-1] if attempt_history else {}
+            last_build_msg = ""
+            last_attempt_status = ""
+            if isinstance(last_attempt, dict):
+                last_attempt_status = str(last_attempt.get("status", "")).strip()
+                last_build_msg = str((last_attempt.get("build_result") or {}).get("message", "")).strip()
+
+            lines = [
+                "=" * 100,
+                f"time              : {datetime.now().isoformat(timespec='seconds')}",
+                f"project           : {snapshot.project_name}",
+                f"project_path      : {snapshot.project_path}",
+                f"build_system      : {snapshot.build_system}",
+                f"source_root_rel   : {snapshot.source_root_rel}",
+                f"overall_status    : {overall_status}",
+                f"dockerfile_path   : {dockerfile_path}",
+                f"build_log_path    : {build_result.get('log_path') or build_log_path}",
+                f"verify_log_path   : {verification_result.get('log_path') or verify_log_path}",
+                f"build_status      : {build_result.get('status', 'unknown')}",
+                f"build_message     : {build_result.get('message', '')}",
+                f"verify_status     : {verification_result.get('status', 'unknown')}",
+                f"verify_message    : {verification_result.get('message', '')}",
+            ]
+
+            if last_attempt_status:
+                lines.append(f"last_attempt_status: {last_attempt_status}")
+            if last_build_msg:
+                lines.append(f"last_attempt_msg   : {last_build_msg}")
+
+            if build_log_text:
+                lines.append("-- build_log_excerpt --")
+                lines.append(_excerpt(build_log_text))
+            if verify_log_text:
+                lines.append("-- verify_log_excerpt --")
+                lines.append(_excerpt(verify_log_text))
+
+            lines.append("")
+
+            with path.open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+                f.write("\n")
+        except Exception:
+            pass
+
+    # -------------------------
     # summary / i/o
     # -------------------------
     def _make_summary(
@@ -1391,6 +1848,7 @@ class CXXCrafterCoordinator:
         agent_usage: Dict[str, Any],
         rag_usage: Dict[str, Any],
         execution_trace: List[Dict[str, Any]],
+        render_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return {
             "project": snapshot.project_name,
@@ -1407,6 +1865,7 @@ class CXXCrafterCoordinator:
             "snapshot": asdict(snapshot),
             "dependency_analysis": asdict(dep_analysis),
             "build_plan": asdict(build_plan),
+            "render_context": render_context or {},
             "agent_usage": agent_usage,
             "llm_usage": agent_usage,
             "rag_usage": rag_usage,
@@ -1459,13 +1918,6 @@ class CXXCrafterCoordinator:
         return {"value": str(result)}
 
     def _coerce_output(self, cls: Type[T], value: Any) -> T:
-        """
-        尽量把 agent 输出转成目标 dataclass 实例。
-        兼容：
-        - 本来就是 dataclass
-        - dict
-        - 带 __dict__ 的对象
-        """
         if isinstance(value, cls):
             return value
 
@@ -1499,7 +1951,6 @@ class CXXCrafterCoordinator:
             except Exception:
                 pass
 
-        # 最后兜底：直接尝试无参构造
         try:
             return cls()  # type: ignore[misc]
         except Exception as e:
@@ -1536,3 +1987,53 @@ class CXXCrafterCoordinator:
         if len(s) <= 8:
             return "***"
         return s[:4] + "..." + s[-4:]
+
+    @staticmethod
+    def _normalize_optional_timeout(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                num = float(text)
+            else:
+                num = float(value)
+            if num <= 0:
+                return None
+            return num
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_cmake_min_version(cmake_text: str) -> Optional[str]:
+        m = re.search(
+            r"cmake_minimum_required\s*\(\s*VERSION\s+([0-9]+(?:\.[0-9]+){1,2})",
+            cmake_text,
+            re.I,
+        )
+        return m.group(1) if m else None
+
+    def _should_skip_verification(self, snapshot: ProjectSnapshot, plan: Any, deps: Any) -> bool:
+        runtime_cmd = str(getattr(plan, "runtime_command", "") or "").strip()
+        if runtime_cmd:
+            return False
+
+        family = str(getattr(deps, "project_family", "") or "").lower()
+        tags = {str(t).lower() for t in (getattr(deps, "feature_tags", []) or [])}
+        test_cmds = list(getattr(plan, "test_commands", []) or [])
+
+        if snapshot.is_gui_project:
+            return True
+        if any(k in family for k in ("gui", "desktop", "qt", "gtk")):
+            return True
+        if tags.intersection({"gui", "gtk", "qt", "desktop", "x11"}):
+            return True
+
+        if snapshot.has_tests and test_cmds:
+            if all(self._looks_like_test_target(cmd) for cmd in test_cmds):
+                if "tests" in tags or any(k in family for k in ("library", "audio_media", "graphics")):
+                    return True
+
+        return False
