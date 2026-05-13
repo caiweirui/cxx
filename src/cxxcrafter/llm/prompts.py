@@ -122,7 +122,7 @@ def dockerfile_user_prompt(context: Dict[str, Any]) -> str:
 你需要为一个 C/C++ 开源项目生成 Dockerfile。
 
 基础镜像：
-{context.get("base_image", "ubuntu:22.04")}
+{context.get("base_image", "ubuntu:24.04")}
 
 项目路径：
 {context.get("project_path", "")}

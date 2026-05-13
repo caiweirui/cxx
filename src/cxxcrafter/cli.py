@@ -31,6 +31,15 @@ def _env_first(*names: str, default: Optional[str] = None) -> Optional[str]:
             return value
     return default
 
+def _normalize_provider_mode(value: Optional[str]) -> str:
+    v = (value or "").strip().lower()
+    if not v:
+        return "auto"
+    if v in {"auto", "openai", "claude", "az"}:
+        return v
+    # 允许自定义分组名
+    return v
+
 def _instantiate(cls: Type[T], **kwargs: Any) -> T:
     """
     尽量兼容不同构造函数签名：
@@ -70,6 +79,7 @@ class CXXCrafterConfig:
     model_name: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    provider_mode: str = "auto"
     temperature: float = 0.2
 
     max_repair_rounds: int = 2
@@ -94,9 +104,8 @@ class CXXCrafterConfig:
 
     use_buildkit: bool = True
     buildkit_progress: str = "plain"
-    default_base_image: str = "ubuntu:22.04"
+    default_base_image: str = "ubuntu:24.04"
 
-    # LLM / Trace 日志路径
     cache_dir: str = "./data/cache"
     llm_usage_log_path: str = "./logs/llm_usage.log"
     llm_trace_log_path: str = "./logs/llm_trace.jsonl"
@@ -119,18 +128,21 @@ class _GPTBotConfigShim:
     global_api_key: Optional[str]
     global_base_url: Optional[str]
     global_model: Optional[str]
+    global_provider_mode: str
     cache_dir: str
     llm_usage_log_path: str
     llm_trace_log_path: str
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     model: Optional[str] = None
+    provider_mode: Optional[str] = None
 
     def get_agent_credentials(self, _agent_name: str) -> Dict[str, Any]:
         return {
             "api_key": self.api_key or self.global_api_key,
             "base_url": self.base_url or self.global_base_url,
             "model": self.model or self.global_model,
+            "provider_mode": self.provider_mode or self.global_provider_mode,
         }
 
 class CXXCrafterCLI:
@@ -154,12 +166,16 @@ class CXXCrafterCLI:
         api_key = config.api_key or _env_first("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY")
         base_url = config.base_url or _env_first("OPENAI_BASE_URL", "BASE_URL")
         model_name = config.model_name or _env_first("OPENAI_MODEL", "MODEL_NAME")
+        provider_mode = _normalize_provider_mode(
+            config.provider_mode or _env_first("LLM_PROVIDER_MODE", default="auto")
+        )
 
         return replace(
             config,
             api_key=api_key,
             base_url=base_url,
             model_name=model_name,
+            provider_mode=provider_mode,
             temperature=float(config.temperature if config.temperature is not None else 0.2),
             max_repair_rounds=max(0, int(config.max_repair_rounds)),
             enable_build=bool(config.enable_build),
@@ -169,7 +185,7 @@ class CXXCrafterCLI:
             enable_rag=bool(config.enable_rag),
             use_buildkit=bool(config.use_buildkit),
             buildkit_progress=str(config.buildkit_progress or "plain"),
-            default_base_image=str(config.default_base_image or "ubuntu:22.04"),
+            default_base_image=str(config.default_base_image or "ubuntu:24.04"),
             failure_log_path=str(config.failure_log_path) if config.failure_log_path else None,
             cache_dir=str(config.cache_dir or "./data/cache"),
             llm_usage_log_path=str(config.llm_usage_log_path or "./logs/llm_usage.log"),
@@ -251,17 +267,18 @@ class CXXCrafterCLI:
             global_api_key=cfg.api_key,
             global_base_url=cfg.base_url,
             global_model=cfg.model_name,
+            global_provider_mode=cfg.provider_mode,
             cache_dir=cfg.cache_dir,
             llm_usage_log_path=cfg.llm_usage_log_path,
             llm_trace_log_path=cfg.llm_trace_log_path,
             api_key=effective.api_key,
             base_url=effective.base_url,
             model=effective.model_name,
+            provider_mode=cfg.provider_mode,
         )
 
-        # GPTBot 会从 config.get_agent_credentials("coordinator") 读取
         return GPTBot(
-            model=effective.model_name or cfg.model_name or "gpt-5.4-mini",
+            model=effective.model_name or cfg.model_name or "gpt-4o",
             config=shim,
         )
 
@@ -299,8 +316,6 @@ class CXXCrafterCLI:
         cfg = config or self.config
         rag_service = cfg.rag_service if cfg.rag_service is not None else self._rag_service
 
-        # 如果外部已经传了一个共享 bot，就直接复用；
-        # 否则为每个 Agent 创建独立 GPTBot，避免消息历史互相污染。
         dependency_bot = cfg.bot if cfg.bot is not None else self._build_gptbot(cfg, cfg.dependency_agent)
         build_bot = cfg.bot if cfg.bot is not None else self._build_gptbot(cfg, cfg.build_agent)
         error_bot = cfg.bot if cfg.bot is not None else self._build_gptbot(cfg, cfg.error_agent)
@@ -323,7 +338,6 @@ class CXXCrafterCLI:
             **self._agent_kwargs(cfg, cfg.repair_agent, rag_service, repair_bot),
         )
 
-        # 给所有 Agent 注入运行时上下文，确保 use_cache 和日志路径真正生效
         for agent in (dependency_agent, build_agent, error_agent, repair_agent):
             self._prime_agent_runtime(agent, cfg)
 
@@ -418,6 +432,7 @@ class CXXCrafterCLI:
         parser.add_argument("--model-name", default=self.config.model_name, help="模型名称")
         parser.add_argument("--api-key", default=self.config.api_key, help="API Key")
         parser.add_argument("--base-url", default=self.config.base_url, help="API Base URL")
+        parser.add_argument("--provider-mode", default=self.config.provider_mode, help="分组/Provider 模式（auto/openai/claude/az/自定义）")
         parser.add_argument("--temperature", type=float, default=self.config.temperature, help="模型温度")
         parser.add_argument("--max-repair-rounds", type=int, default=self.config.max_repair_rounds, help="最大修复轮次")
         parser.add_argument("--build-timeout", type=float, default=self.config.build_timeout_seconds, help="构建超时秒数")
@@ -447,6 +462,7 @@ class CXXCrafterCLI:
             model_name=args.model_name,
             api_key=args.api_key,
             base_url=args.base_url,
+            provider_mode=_normalize_provider_mode(args.provider_mode),
             temperature=args.temperature,
             max_repair_rounds=args.max_repair_rounds,
             build_timeout_seconds=args.build_timeout,
@@ -470,6 +486,7 @@ class CXXCrafterCLI:
             model_name=cfg.model_name,
             api_key=cfg.api_key,
             base_url=cfg.base_url,
+            provider_mode=cfg.provider_mode,
             temperature=cfg.temperature,
             max_repair_rounds=cfg.max_repair_rounds,
             enable_build=cfg.enable_build,

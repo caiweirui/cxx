@@ -11,7 +11,7 @@ import tkinter as tk
 from io import StringIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 # =========================================================
 # 添加 src 到路径
@@ -24,13 +24,14 @@ if str(SRC_ROOT) not in sys.path:
 os.environ.setdefault("LLM_USAGE_LOG_PATH", str(PROJECT_ROOT / "logs" / "llm_usage.log"))
 os.environ.setdefault("LLM_TRACE_LOG_PATH", str(PROJECT_ROOT / "logs" / "llm_trace.jsonl"))
 os.environ.setdefault("AGENT_TRACE_LOG_PATH", str(PROJECT_ROOT / "logs" / "agent_trace.jsonl"))
+os.environ.setdefault("OPENAI_BASE_URL", "https://poloapi.top/v1/chat/completions")
+os.environ.setdefault("LLM_PROVIDER_MODE", "auto")
 
 from cxxcrafter.cli import (
     AgentRuntimeConfig,
     CXXCrafterCLI,
     CXXCrafterConfig,
 )
-
 from cxxcrafter.execution.batch_executor import BatchExecutor
 from cxxcrafter.runtime.os_compat import format_os_tip, open_path
 
@@ -160,6 +161,7 @@ def build_cli_from_config(config: Dict[str, Any]) -> CXXCrafterCLI:
         api_key=strip_outer_quotes(config.get("api_key", "")) or None,
         base_url=strip_outer_quotes(config.get("base_url", "")) or None,
         model_name=strip_outer_quotes(config.get("model_name", "")) or None,
+        provider_mode=str(config.get("provider_mode", "auto") or "auto").strip() or "auto",
         enable_build=bool(config.get("enable_build", True)),
         enable_verification=bool(config.get("enable_verification", True)),
         generate_only=bool(config.get("generate_only", False)),
@@ -174,7 +176,7 @@ def build_cli_from_config(config: Dict[str, Any]) -> CXXCrafterCLI:
         enable_rag=bool(config.get("enable_rag", True)),
         use_buildkit=bool(config.get("use_buildkit", True)),
         buildkit_progress=str(config.get("buildkit_progress", "plain") or "plain"),
-        default_base_image=str(config.get("default_base_image", "ubuntu:22.04") or "ubuntu:22.04"),
+        default_base_image=str(config.get("default_base_image", "ubuntu:24.04") or "ubuntu:24.04"),
         dependency_agent=_build_agent_runtime_config("dependency", config),
         build_agent=_build_agent_runtime_config("build", config),
         error_agent=_build_agent_runtime_config("error", config),
@@ -272,11 +274,12 @@ class CXXCrafterGUI:
         # 全局配置
         self.global_api_key_var = tk.StringVar(value="")
         self.global_base_url_var = tk.StringVar(value="")
-        self.global_model_var = tk.StringVar(value="gpt-5.4-mini")
+        self.global_model_var = tk.StringVar(value="gpt-4o")
+        self.global_provider_mode_var = tk.StringVar(value="auto")
 
         self.output_dir_var = tk.StringVar(value=str(PROJECT_ROOT / "dockerfile_playground"))
         self.logs_dir_var = tk.StringVar(value=str(PROJECT_ROOT / "data" / "build_logs"))
-        self.default_base_image_var = tk.StringVar(value="ubuntu:22.04")
+        self.default_base_image_var = tk.StringVar(value="ubuntu:24.04")
         self.buildkit_progress_var = tk.StringVar(value="plain")
 
         self.enable_build_var = tk.BooleanVar(value=True)
@@ -329,6 +332,7 @@ class CXXCrafterGUI:
             "api_key": self.global_api_key_var.get().strip(),
             "base_url": self.global_base_url_var.get().strip(),
             "model_name": self.global_model_var.get().strip(),
+            "provider_mode": self.global_provider_mode_var.get().strip() or "auto",
             "enable_build": bool(self.enable_build_var.get()),
             "enable_verification": bool(self.enable_verify_var.get()),
             "generate_only": bool(self.generate_only_var.get()),
@@ -338,7 +342,7 @@ class CXXCrafterGUI:
             "buildkit_progress": self.buildkit_progress_var.get().strip() or "plain",
             "output_dir": self.output_dir_var.get().strip(),
             "log_dir": self.logs_dir_var.get().strip(),
-            "default_base_image": self.default_base_image_var.get().strip() or "ubuntu:22.04",
+            "default_base_image": self.default_base_image_var.get().strip() or "ubuntu:24.04",
             "enable_rag": bool(self.enable_rag_var.get()),
             "build_timeout_seconds": _safe_float(self.build_timeout_seconds_var.get(), 1800.0),
             "verify_timeout_seconds": _safe_float(self.verify_timeout_seconds_var.get(), 600.0),
@@ -371,7 +375,8 @@ class CXXCrafterGUI:
         lines = []
         lines.append("智能体配置")
         lines.append("=" * 60)
-        lines.append(f"全局模型: {self.global_model_var.get().strip() or 'gpt-5.4-mini'}")
+        lines.append(f"全局模型: {self.global_model_var.get().strip() or 'gpt-4o'}")
+        lines.append(f"全局分组: {self.global_provider_mode_var.get().strip() or 'auto'}")
         lines.append(f"全局 API Key: {'已设置' if self.global_api_key_var.get().strip() else '未设置'}")
         lines.append(f"全局 Base URL: {self.global_base_url_var.get().strip() or '未设置'}")
         lines.append("")
@@ -402,6 +407,7 @@ class CXXCrafterGUI:
             ("API Key", self.global_api_key_var, True),
             ("Base URL", self.global_base_url_var, False),
             ("模型名称", self.global_model_var, False),
+            ("分组选择", self.global_provider_mode_var, False),
             ("输出目录", self.output_dir_var, False),
             ("日志目录", self.logs_dir_var, False),
             ("默认基础镜像", self.default_base_image_var, False),
@@ -449,7 +455,7 @@ class CXXCrafterGUI:
 
         note = ttk.Label(
             agents_frame,
-            text="说明：若某个智能体不勾选“独立配置”，则自动继承全局模型 / API Key / Base URL。",
+            text="说明：若某个智能体不勾选“独立配置”，则自动继承全局模型 / API Key / Base URL / 分组。",
             foreground="gray",
         )
         note.pack(anchor="w", pady=(8, 0))
@@ -483,10 +489,11 @@ class CXXCrafterGUI:
     def _reset_defaults(self):
         self.global_api_key_var.set("")
         self.global_base_url_var.set("")
-        self.global_model_var.set("gpt-5.4-mini")
+        self.global_model_var.set("gpt-4o")
+        self.global_provider_mode_var.set("auto")
         self.output_dir_var.set(str(PROJECT_ROOT / "dockerfile_playground"))
         self.logs_dir_var.set(str(PROJECT_ROOT / "data" / "build_logs"))
-        self.default_base_image_var.set("ubuntu:22.04")
+        self.default_base_image_var.set("ubuntu:24.04")
         self.buildkit_progress_var.set("plain")
         self.max_repair_rounds_var.set("2")
         self.build_timeout_seconds_var.set("1800")
@@ -649,7 +656,6 @@ class CXXCrafterGUI:
             build_timeout_seconds = _safe_float(self.build_timeout_seconds_var.get(), 1800.0)
             verify_timeout_seconds = _safe_float(self.verify_timeout_seconds_var.get(), 600.0)
 
-            # 关键修复：空值 / 0 / 0.0 都视为未启用项目总超时
             project_timeout_seconds = _parse_optional_positive_float(self.project_timeout_seconds_var.get())
 
             max_consecutive_failures = _safe_int(self.max_consecutive_failures_var.get(), 100)
@@ -935,6 +941,7 @@ class CXXCrafterGUI:
             "6. 支持 Linux / Windows\n"
             "7. 支持 Docker 异常快速停止\n"
             "8. 支持连续失败阈值\n"
+            "9. 支持分组选择（auto / az / 自定义）\n"
         )
         ttk.Label(outer, text=text, justify="left", font=("Microsoft YaHei UI", 11)).pack(anchor="w")
 
@@ -959,7 +966,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--api-key", type=str, default="")
     parser.add_argument("--base-url", type=str, default="")
-    parser.add_argument("--model-name", type=str, default="gpt-5.4-mini")
+    parser.add_argument("--model-name", type=str, default="gpt-4o")
+    parser.add_argument("--provider-mode", type=str, default="auto")
 
     parser.add_argument("--enable-build", action="store_true", default=True)
     parser.add_argument("--disable-build", action="store_true")
@@ -972,13 +980,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-buildkit", action="store_true", default=True)
     parser.add_argument("--no-buildkit", action="store_true")
     parser.add_argument("--buildkit-progress", type=str, default="plain")
-    parser.add_argument("--default-base-image", type=str, default="ubuntu:22.04")
+    parser.add_argument("--default-base-image", type=str, default="ubuntu:24.04")
     parser.add_argument("--max-repair-rounds", type=int, default=2)
 
     parser.add_argument("--build-timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--verify-timeout-seconds", type=float, default=600.0)
 
-    # 关键修复：默认 None，表示未启用项目总超时
+    # 默认 None，表示未启用项目总超时
     parser.add_argument("--project-timeout-seconds", type=float, default=None)
 
     parser.add_argument("--stop-on-docker-error", action="store_true", default=True)
@@ -992,6 +1000,7 @@ def run_headless(args: argparse.Namespace) -> Dict[str, Any]:
         "api_key": strip_outer_quotes(args.api_key),
         "base_url": strip_outer_quotes(args.base_url),
         "model_name": args.model_name,
+        "provider_mode": strip_outer_quotes(args.provider_mode) or "auto",
         "enable_build": bool(not args.disable_build),
         "enable_verification": bool(not args.disable_verification),
         "generate_only": bool(args.generate_only),
@@ -1001,16 +1010,14 @@ def run_headless(args: argparse.Namespace) -> Dict[str, Any]:
         "buildkit_progress": args.buildkit_progress or "plain",
         "output_dir": strip_outer_quotes(args.output_dir),
         "log_dir": strip_outer_quotes(args.log_dir),
-        "default_base_image": args.default_base_image or "ubuntu:22.04",
+        "default_base_image": args.default_base_image or "ubuntu:24.04",
         "enable_rag": True,
 
-        # headless 模式也保留“独立配置字段”，但默认继承全局
         "dependency_use_separate_config": False,
         "build_use_separate_config": False,
         "error_use_separate_config": False,
         "repair_use_separate_config": False,
 
-        # 给 build_cli_from_config 用
         "project_timeout_seconds": args.project_timeout_seconds,
     }
 

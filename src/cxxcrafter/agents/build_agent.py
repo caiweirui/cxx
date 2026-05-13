@@ -43,7 +43,7 @@ def _contains_any(haystack: str, keywords: List[str]) -> bool:
 
 @dataclass
 class BuildPlan:
-    base_image: str = "ubuntu:22.04"
+    base_image: str = "ubuntu:24.04"
     workdir: str = "/workspace"
     copy_paths: List[str] = field(default_factory=lambda: ["."])
     preinstall_commands: List[str] = field(default_factory=list)
@@ -106,7 +106,7 @@ class BuildAgent(BaseAgent):
 
 JSON 结构：
 {{
-  "base_image": "ubuntu:22.04",
+  "base_image": "ubuntu:24.04",
   "workdir": "/workspace",
   "copy_paths": ["."],
   "preinstall_commands": ["..."],
@@ -129,7 +129,7 @@ RAG 文档上下文：
 """.strip()
 
         default = {
-            "base_image": "ubuntu:22.04",
+            "base_image": "ubuntu:24.04",
             "workdir": "/workspace",
             "copy_paths": [snapshot.get("source_root_rel", ".")],
             "preinstall_commands": [],
@@ -204,7 +204,7 @@ RAG 文档上下文：
         env = dict(data.get("env", {}) or {})
         notes = _as_str_list(data.get("notes", []))
 
-        base_image = str(data.get("base_image", "ubuntu:22.04") or "ubuntu:22.04").strip()
+        base_image = str(data.get("base_image", "ubuntu:24.04") or "ubuntu:24.04").strip()
         workdir = str(data.get("workdir", "/workspace") or "/workspace").strip()
 
         preinstall_commands = _as_str_list(data.get("preinstall_commands", []))

@@ -40,6 +40,8 @@ class ProjectSnapshot:
     has_makefile: bool = False
     has_autotools: bool = False
     has_meson: bool = False
+    has_bazel: bool = False
+    has_scons: bool = False
 
     has_package_json: bool = False
     has_pyproject: bool = False
@@ -129,11 +131,26 @@ class CXXCrafterCoordinator:
         verify_log_path = str(Path(log_dir) / f"{project_name}_verify.log")
         summary_path = str(Path(log_dir) / f"{project_name}_summary.json")
 
-        generator = (
-            self.dockerfile_generator_factory(project_path)
-            if self.dockerfile_generator_factory
-            else DockerfileGenerator(project_path)
-        )
+        generator = None
+        if self.dockerfile_generator_factory:
+            try:
+                generator = self.dockerfile_generator_factory(
+                    project_path,
+                    default_base_image="ubuntu:24.04",
+                )
+            except TypeError:
+                try:
+                    generator = self.dockerfile_generator_factory(
+                        project_path,
+                        base_image="ubuntu:24.04",
+                    )
+                except TypeError:
+                    generator = self.dockerfile_generator_factory(project_path)
+        else:
+            generator = DockerfileGenerator(
+                project_path,
+                default_base_image="ubuntu:24.04",
+            )
 
         dep_seed = self._rule_dependency_seed(snapshot)
         snapshot.rule_apt_packages = dep_seed["apt_packages"]
@@ -195,6 +212,8 @@ class CXXCrafterCoordinator:
             "has_makefile": snapshot.has_makefile,
             "has_autotools": snapshot.has_autotools,
             "has_meson": snapshot.has_meson,
+            "has_bazel": snapshot.has_bazel,
+            "has_scons": snapshot.has_scons,
             "required_cmake_version": snapshot.required_cmake_version,
             "requires_qt6": snapshot.requires_qt6,
             "requires_boost": snapshot.requires_boost,
@@ -746,27 +765,160 @@ class CXXCrafterCoordinator:
     # -------------------------
     # 规则层
     # -------------------------
+    def _pick_best_source_root(self, root: Path, candidates: List[Path]) -> Path:
+        """
+        从候选目录里选一个更稳的构建入口：
+        - 根目录最高优先级
+        - docs / examples / tests / thirdparty / vendor / external / platform / android / java / jni / demo / samples / tutorial 强降权
+        - 真实构建文件加分
+        """
+        if not candidates:
+            return root
+
+        root = root.resolve()
+        uniq: List[Path] = []
+        seen = set()
+
+        for p in candidates:
+            try:
+                rp = p.resolve()
+            except Exception:
+                rp = p
+            key = str(rp)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(rp)
+
+        def score(p: Path) -> tuple:
+            try:
+                rel = p.relative_to(root)
+                depth = len(rel.parts)
+                rel_text = rel.as_posix().lower()
+            except Exception:
+                depth = 999
+                rel_text = str(p).lower()
+
+            bonus = 0
+
+            # 根目录优先
+            if p == root:
+                bonus += 250
+
+            # 真实构建文件
+            if (p / "CMakeLists.txt").exists():
+                bonus += 45
+            if (p / "meson.build").exists():
+                bonus += 40
+            if (p / "configure.ac").exists() or (p / "configure.in").exists() or (p / "configure").exists():
+                bonus += 40
+            if (p / "Makefile").exists() or (p / "makefile").exists():
+                bonus += 35
+            if (p / "BUILD.bazel").exists() or (p / "WORKSPACE").exists() or (p / "MODULE.bazel").exists():
+                bonus += 50
+            if (p / "SConstruct").exists() or (p / "SConscript").exists():
+                bonus += 35
+
+            # 强烈惩罚常见“非主入口”目录
+            bad_tokens = (
+                "docs", "doc", "documentation",
+                "examples", "example", "samples", "sample",
+                "tests", "test", "testsuite",
+                "thirdparty", "third-party", "vendor", "external", "extern",
+                "submodule", "deps", "dependency", "dependencies",
+                "platform", "android", "ios", "java", "jni",
+                "demo", "demos",
+                "tutorial",
+                "nativeSrcsConfigs",
+                "template",
+            )
+            if any(x in rel_text for x in bad_tokens):
+                bonus -= 150
+
+            # 越深越不优先
+            if depth >= 4:
+                bonus -= (depth - 3) * 15
+
+            return (-bonus, depth, len(str(p)))
+
+        return sorted(uniq, key=score)[0]
+
+    def _detect_build_system_override(self, project_name: str, flags: Dict[str, bool]) -> Optional[str]:
+        """
+        针对少数典型项目做构建系统兜底识别。
+        """
+        name = project_name.lower()
+
+        # 强信号优先
+        if name == "bazel":
+            return "bazel"
+
+        # Godot 主构建系统是 SCons
+        if name == "godot":
+            return "scons"
+
+        # 一些已知项目的经验性修正
+        if name in {"crow", "musescore", "drogon"}:
+            return "cmake"
+
+        if name in {"soloud", "audioflux"}:
+            # 这两个项目经常被子目录里的 Makefile / demo 目录误导
+            # 仍然保留 make，但要依赖更严格的根目录判断
+            return "make"
+
+        if name == "gcc":
+            return "autotools"
+
+        if name == "linux":
+            return "make"
+
+        if name in {"llvm", "clang", "llvm-project"}:
+            return "cmake"
+
+        if name in {"scons", "sconstruct"}:
+            return "scons"
+
+        return None
+
     def _snapshot_project(self, project_path: str) -> ProjectSnapshot:
-        root = Path(project_path)
+        root = Path(project_path).resolve()
         project_name = root.name
+        project_name_l = project_name.lower()
 
         has_cmakelists = False
         has_makefile = False
         has_autotools = False
         has_meson = False
+        has_bazel = False
+        has_scons = False
+
         has_package_json = False
         has_pyproject = False
         has_requirements = False
         has_dockerfile = False
         files_sample: List[str] = []
 
-        source_root_rel = "."
-        build_system = "unknown"
+        cmake_candidates: List[Path] = []
+        make_candidates: List[Path] = []
+        autotools_candidates: List[Path] = []
+        meson_candidates: List[Path] = []
+        bazel_candidates: List[Path] = []
+        scons_candidates: List[Path] = []
 
-        cmake_candidates = []
-        make_candidates = []
-        autotools_candidates = []
-        meson_candidates = []
+        # 根目录级特征，优先级最高
+        root_has_cmake = (root / "CMakeLists.txt").exists()
+        root_has_make = (root / "Makefile").exists() or (root / "makefile").exists()
+        root_has_autotools = (
+            (root / "configure.ac").exists()
+            or (root / "configure.in").exists()
+            or (root / "autogen.sh").exists()
+            or (root / "configure").exists()
+        )
+        root_has_meson = (root / "meson.build").exists()
+        root_has_scons = (root / "SConstruct").exists() or (root / "SConscript").exists()
+        root_has_workspace = (root / "WORKSPACE").exists() or (root / "MODULE.bazel").exists()
+        root_has_bazel_build = (root / "BUILD.bazel").exists()
+        root_has_build = (root / "BUILD").exists()
 
         for p in root.rglob("*"):
             if len(files_sample) < 120 and p.is_file():
@@ -778,21 +930,36 @@ class CXXCrafterCoordinator:
             if name == "CMakeLists.txt":
                 has_cmakelists = True
                 cmake_candidates.append(p.parent)
-            elif name in ("Makefile", "makefile"):
+
+            elif name in ("Makefile", "makefile") or low_name.endswith(".mk"):
                 has_makefile = True
                 make_candidates.append(p.parent)
-            elif name in ("configure.ac", "configure.in") or low_name == "autogen.sh":
+
+            elif name in ("configure.ac", "configure.in") or low_name in {"autogen.sh", "configure"} or low_name.endswith(".m4"):
                 has_autotools = True
                 autotools_candidates.append(p.parent)
+
             elif name == "meson.build":
                 has_meson = True
                 meson_candidates.append(p.parent)
+
+            elif name in ("BUILD", "BUILD.bazel", "WORKSPACE", "MODULE.bazel"):
+                has_bazel = True
+                bazel_candidates.append(p.parent)
+
+            elif name in ("SConstruct", "SConscript"):
+                has_scons = True
+                scons_candidates.append(p.parent)
+
             elif name == "package.json":
                 has_package_json = True
+
             elif name == "pyproject.toml":
                 has_pyproject = True
+
             elif name == "requirements.txt":
                 has_requirements = True
+
             elif low_name == "dockerfile":
                 has_dockerfile = True
 
@@ -804,9 +971,36 @@ class CXXCrafterCoordinator:
         has_tests = False
         is_gui_project = False
 
-        if has_cmakelists:
+        override = self._detect_build_system_override(
+            project_name=project_name,
+            flags={
+                "has_cmakelists": has_cmakelists,
+                "has_makefile": has_makefile,
+                "has_autotools": has_autotools,
+                "has_meson": has_meson,
+                "has_bazel": has_bazel,
+                "has_scons": has_scons,
+            },
+        )
+
+        # 修复顺序：
+        # 1) Bazel / SCons
+        # 2) CMake
+        # 3) Meson
+        # 4) Make
+        # 5) Autotools
+        # 避免第三方子目录里的 configure/ac、docs、tests 抢走主入口
+        if override == "bazel" or root_has_workspace or root_has_bazel_build or (root_has_build and not root_has_cmake and not root_has_scons and not root_has_autotools and not root_has_meson):
+            build_system = "bazel"
+            source_root_rel = "."
+
+        elif override == "scons" or root_has_scons:
+            build_system = "scons"
+            source_root_rel = "."
+
+        elif override == "cmake" or root_has_cmake or has_cmakelists:
             build_system = "cmake"
-            cmake_dir = sorted(cmake_candidates, key=lambda p: len(str(p).split(os.sep)))[0]
+            cmake_dir = self._pick_best_source_root(root, cmake_candidates or [root])
             source_root_rel = str(cmake_dir.relative_to(root)) if cmake_dir != root else "."
             cmake_file = cmake_dir / "CMakeLists.txt"
             cmake_text = self._read_text_file(cmake_file)
@@ -841,23 +1035,32 @@ class CXXCrafterCoordinator:
                     "xcb",
                 ]
             ) or requires_qt6
-        elif has_meson:
+
+        elif override == "meson" or root_has_meson or has_meson:
             build_system = "meson"
-            meson_dir = sorted(meson_candidates, key=lambda p: len(str(p).split(os.sep)))[0]
+            meson_dir = self._pick_best_source_root(root, meson_candidates or [root])
             source_root_rel = str(meson_dir.relative_to(root)) if meson_dir != root else "."
-        elif has_autotools:
-            build_system = "autotools"
-            auto_dir = sorted(autotools_candidates, key=lambda p: len(str(p).split(os.sep)))[0]
-            source_root_rel = str(auto_dir.relative_to(root)) if auto_dir != root else "."
-        elif has_makefile:
+
+        elif override == "make" or root_has_make or has_makefile:
             build_system = "make"
-            make_dir = sorted(make_candidates, key=lambda p: len(str(p).split(os.sep)))[0]
+            make_dir = self._pick_best_source_root(root, make_candidates or [root])
             source_root_rel = str(make_dir.relative_to(root)) if make_dir != root else "."
+
+        elif override == "autotools" or root_has_autotools or has_autotools:
+            build_system = "autotools"
+            auto_dir = self._pick_best_source_root(root, autotools_candidates or [root])
+            source_root_rel = str(auto_dir.relative_to(root)) if auto_dir != root else "."
+
         elif has_package_json:
             build_system = "node"
             source_root_rel = "."
+
         elif has_pyproject or has_requirements:
             build_system = "python"
+            source_root_rel = "."
+
+        # Bazel 项目绝不允许落到子目录
+        if build_system == "bazel":
             source_root_rel = "."
 
         return ProjectSnapshot(
@@ -869,6 +1072,8 @@ class CXXCrafterCoordinator:
             has_makefile=has_makefile,
             has_autotools=has_autotools,
             has_meson=has_meson,
+            has_bazel=has_bazel,
+            has_scons=has_scons,
             has_package_json=has_package_json,
             has_pyproject=has_pyproject,
             has_requirements=has_requirements,
@@ -942,17 +1147,32 @@ class CXXCrafterCoordinator:
             apt_packages += ["meson", "ninja-build", "pkg-config", "build-essential"]
             notes.append("Detected Meson project")
             notes.append(f"Meson source root: {snapshot.source_root_rel}")
+
         elif snapshot.build_system == "autotools":
             apt_packages += ["autoconf", "automake", "libtool", "pkg-config", "build-essential"]
             notes.append("Detected Autotools project")
             notes.append(f"Autotools source root: {snapshot.source_root_rel}")
+
         elif snapshot.build_system == "make":
             apt_packages += ["build-essential", "make", "pkg-config"]
             notes.append("Detected Makefile project")
             notes.append(f"Make source root: {snapshot.source_root_rel}")
+
+        elif snapshot.build_system == "bazel":
+            # Bazel 不依赖 apt 里的 bazel 包，统一走 bazelisk/bootstrap
+            apt_packages += ["curl", "unzip", "zip", "openjdk-17-jdk", "build-essential", "pkg-config"]
+            notes.append("Detected Bazel project")
+            notes.append(f"Bazel source root: {snapshot.source_root_rel}")
+
+        elif snapshot.build_system == "scons":
+            apt_packages += ["scons", "build-essential", "pkg-config"]
+            notes.append("Detected SCons project")
+            notes.append(f"SCons source root: {snapshot.source_root_rel}")
+
         elif snapshot.build_system == "node":
             apt_packages += ["nodejs", "npm"]
             notes.append("Detected Node project")
+
         elif snapshot.build_system == "python":
             apt_packages += ["python3", "python3-pip", "python3-venv"]
             notes.append("Detected Python project")
@@ -1420,8 +1640,15 @@ class CXXCrafterCoordinator:
             add_apt("python3-pip")
             add_apt("python3-venv")
 
+        # Bazel / Java
+        if "bazel" in low and ("command not found" in low or "not found" in low):
+            add_apt("openjdk-17-jdk")
+            add_apt("curl")
+            add_apt("unzip")
+            add_apt("zip")
+
         # Boost / X11 / OpenGL / Qt
-        if "could not find boost" in low or "boost_include_dir" in low or "boost_system" in low or "boost_thread" in low:
+        if "could not find boost" in low or "boost_include_dir" in low or "boost_system" in low or "boost_thread" in low or "findpackage(boost" in low:
             add_apt("libboost-all-dev")
 
         if "could not find x11" in low or "findx11.cmake" in low or "missing: x11_x11_include_path" in low or "missing: x11_x11_lib" in low:
@@ -1455,7 +1682,7 @@ class CXXCrafterCoordinator:
             add_apt("libqt5svg5-dev")
             add_apt("libqt5x11extras5-dev")
 
-        # 本次最关键：COPY / 路径 / source_root
+        # COPY / 路径 / source_root 问题
         if any(
             s in low
             for s in [
@@ -1468,11 +1695,11 @@ class CXXCrafterCoordinator:
                 "can't stat",
             ]
         ) and ("copy" in low or "dockerfile" in low or "/workspace/" in low):
-            add_note("Docker COPY/path failure detected. Generate COPY with JSON-array syntax and keep source_root_rel as quoted relative path.")
+            add_note("Docker COPY/path failure detected. Generate COPY with JSON-array syntax and keep source_root_rel as a quoted relative path.")
             add_note("Do not concatenate paths with spaces into a plain `COPY a b` form.")
             add_note("If the project root is a subdirectory, ensure commands cd into source_root_rel before building.")
 
-        # 本次最关键：autotools 的 CRLF / bad interpreter
+        # autotools 的 CRLF / bad interpreter
         if any(
             s in low
             for s in [
@@ -1635,7 +1862,7 @@ class CXXCrafterCoordinator:
             test_commands=new_test,
             notes=new_notes,
             confidence=max(
-                plan.confidence,
+                getattr(plan, "confidence", 0.0),
                 patch.confidence,
                 getattr(failure, "confidence", 0.0),
             ),
@@ -1661,9 +1888,7 @@ class CXXCrafterCoordinator:
 
             for item in seq:
                 s = str(item).strip()
-                if not s:
-                    continue
-                if s in seen:
+                if not s or s in seen:
                     continue
                 seen.add(s)
                 out.append(s)
@@ -1671,7 +1896,7 @@ class CXXCrafterCoordinator:
         return out
 
     # -------------------------
-    # 失败上下文打包（新增）
+    # failure context packaging
     # -------------------------
     def _build_repair_failure_payload(
         self,
@@ -1718,7 +1943,7 @@ class CXXCrafterCoordinator:
                 "build_log_excerpt": self._excerpt(log_source, 8000),
                 "dockerfile_text": dockerfile_text,
             },
-        }    
+        }
 
     def _excerpt(self, text: str, max_chars: int = 4000) -> str:
         text = text or ""
@@ -1752,7 +1977,7 @@ class CXXCrafterCoordinator:
         return [str(value)] if str(value).strip() else []
 
     # -------------------------
-    # 失败汇总日志
+    # failure summary log
     # -------------------------
     def _append_failure_log(
         self,

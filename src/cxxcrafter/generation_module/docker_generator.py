@@ -17,7 +17,7 @@ def _is_parsed_project(obj: Any) -> bool:
 def generate_dockerfile(
     project_or_parsed: Union[str, Dict[str, Any]],
     config: Any = None,
-    base_image: str = "ubuntu:22.04",
+    base_image: str = "ubuntu:24.04",
     agent_result: Optional[Dict[str, Any]] = None,
     output_path: Optional[str] = None,
     compatibility_mode: bool = True,
