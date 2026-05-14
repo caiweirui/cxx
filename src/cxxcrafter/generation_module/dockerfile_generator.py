@@ -48,7 +48,7 @@ class DockerfileGenerator:
     DEFAULT_APT_HTTP_TIMEOUT = 30
 
     # Docker Hub 代理前缀
-    DEFAULT_BASE_IMAGE_MIRROR = os.getenv("CXXCRAFTER_BASE_IMAGE_MIRROR", "dockerproxy.com/library")
+    DEFAULT_BASE_IMAGE_MIRROR = os.getenv("CXXCRAFTER_BASE_IMAGE_MIRROR", "")
 
     def __init__(self, project_root: str, default_base_image: str = "ubuntu:24.04") -> None:
         self.project_root = Path(project_root).resolve()
@@ -216,6 +216,9 @@ class DockerfileGenerator:
         )
         apt_packages = _dedupe(apt_packages + inferred)
 
+        # 过滤掉 Ubuntu 24.04 中不存在的 apt 包（LLM 可能生成不存在的包名）
+        apt_packages = self._filter_unavailable_apt_packages(apt_packages, base_image)
+
         # Bazel 专用：最终强制收口，彻底去掉 cmake / autotools / protobuf / boost 噪声
         if build_system == "bazel":
             apt_packages = self._filter_bazel_apt_packages(apt_packages)
@@ -230,7 +233,7 @@ class DockerfileGenerator:
             apt_packages = _dedupe(apt_packages + ["qt6-base-dev", "qt6-tools-dev", "qt6-tools-dev-tools"])
         if requires_boost:
             apt_packages = _dedupe(apt_packages + ["libboost-all-dev"])
-        if requires_x11 or is_gui_project:
+        if requires_x11:
             apt_packages = _dedupe(
                 apt_packages
                 + [
@@ -243,10 +246,9 @@ class DockerfileGenerator:
                     "libxkbcommon-x11-dev",
                     "libxinerama-dev",
                     "libwayland-dev",
-                    "xorg-dev",
                 ]
             )
-        if requires_opengl or is_gui_project:
+        if requires_opengl:
             apt_packages = _dedupe(
                 apt_packages
                 + [
@@ -266,7 +268,7 @@ class DockerfileGenerator:
         if required_cmake_version and self._version_gt(required_cmake_version, "3.22.1"):
             apt_packages = _dedupe(["python3", "python3-pip", "python3-venv"] + apt_packages)
             cmake_upgrade_step = self._render_run(
-                f'python3 -m pip install --no-cache-dir "cmake>={required_cmake_version}"'
+                f'python3 -m pip install --no-cache-dir --break-system-packages "cmake>={required_cmake_version}"'
             )
 
         # 基础工具兜底
@@ -392,8 +394,8 @@ class DockerfileGenerator:
 
         # Python 包
         if pip_packages:
-            lines.append(self._render_run("python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel"))
-            lines.append(self._render_run("python3 -m pip install --no-cache-dir " + " ".join(pip_packages)))
+            lines.append(self._render_run("python3 -m pip install --no-cache-dir --break-system-packages --upgrade pip setuptools wheel"))
+            lines.append(self._render_run("python3 -m pip install --no-cache-dir --break-system-packages " + " ".join(pip_packages)))
 
         # build commands
         for cmd in build_commands:
@@ -839,15 +841,27 @@ class DockerfileGenerator:
         if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$", raw):
             return default
 
+        # 自动升级过旧的 Ubuntu 基础镜像到 24.04
+        # 20.04 已接近 EOL，22.04 的部分依赖包版本较旧
+        if re.match(r"^ubuntu:(20\.04|22\.04)$", raw):
+            return "ubuntu:24.04"
+
         return raw
 
     def _render_from_lines(self, base_image: str) -> List[str]:
         image = self._normalize_base_image(base_image, default=self.default_base_image or "ubuntu:24.04")
         if self._is_official_base_image(image):
-            return [
-                f"ARG BASE_IMAGE_MIRROR={self.DEFAULT_BASE_IMAGE_MIRROR}",
-                f"FROM ${{BASE_IMAGE_MIRROR}}/{image}",
-            ]
+            mirror = self.DEFAULT_BASE_IMAGE_MIRROR.strip()
+            if mirror:
+                # 有镜像代理时，使用 ARG + FROM 组合
+                # 用户可通过 --build-arg BASE_IMAGE_MIRROR= 切换回官方源
+                return [
+                    f"ARG BASE_IMAGE_MIRROR={mirror}",
+                    f"FROM ${{BASE_IMAGE_MIRROR}}/{image}",
+                ]
+            else:
+                # 无镜像代理，直接使用 docker.io 官方源
+                return [f"FROM {image}"]
         return [f"FROM {image}"]
 
     def _normalize_copy_paths(self, paths: List[str], source_root_rel: str) -> List[str]:
@@ -861,6 +875,48 @@ class DockerfileGenerator:
             normalized.insert(0, source_root_rel)
 
         return normalized
+
+    def _filter_unavailable_apt_packages(self, packages: List[str], base_image: str) -> List[str]:
+        """
+        过滤掉在目标 Ubuntu 版本中不存在的 apt 包。
+        LLM 可能会生成不存在的包名（如 gcc-15、g++-15 在 Ubuntu 24.04 中不存在）。
+        """
+        # Ubuntu 24.04 (noble) 中不存在的常见误判包
+        noble_blacklist = {
+            "gcc-15", "g++-15", "cpp-15",
+            "gcc-16", "g++-16", "cpp-16",
+            "llvm-19-dev", "llvm-19-tools",
+            "clang-19",
+        }
+        # Ubuntu 22.04 (jammy) 中不存在的常见误判包
+        jammy_blacklist = {
+            "gcc-14", "g++-14", "cpp-14",
+            "gcc-15", "g++-15", "cpp-15",
+            "gcc-16", "g++-16", "cpp-16",
+            "libavif-dev",
+        }
+        # Ubuntu 20.04 (focal) 中不存在的常见误判包
+        focal_blacklist = {
+            "gcc-12", "g++-12", "cpp-12",
+            "gcc-13", "g++-13", "cpp-13",
+            "gcc-14", "g++-14", "cpp-14",
+            "gcc-15", "g++-15", "cpp-15",
+            "libavif-dev",
+        }
+
+        blacklist = set()
+        low = base_image.lower()
+        if "24.04" in low or "noble" in low:
+            blacklist = noble_blacklist
+        elif "22.04" in low or "jammy" in low:
+            blacklist = jammy_blacklist
+        elif "20.04" in low or "focal" in low:
+            blacklist = focal_blacklist
+
+        if not blacklist:
+            return packages
+
+        return [p for p in packages if p.lower() not in {b.lower() for b in blacklist}]
 
     def _normalize_workdir(self, workdir: str) -> str:
         workdir = str(workdir).strip().replace("\\", "/")
@@ -1739,7 +1795,7 @@ class DockerfileGenerator:
             packages.extend(["autoconf", "automake", "libtool", "gettext", "bison", "flex", "make", "dos2unix"])
         if re.search(r"\bpkg-config\b", text):
             packages.append("pkg-config")
-        if re.search(r"\bpython3\b", text) or re.search(r"\bpip\b", text) or "python" in text:
+        if re.search(r"\bpython3\b", text) or re.search(r"\bpip\b", text) or re.search(r"\bpython\b", text):
             packages.extend(["python3", "python3-pip", "python3-venv"])
         if re.search(r"\bscons\b", text) or build_system == "scons":
             packages.append("scons")
@@ -1774,8 +1830,8 @@ class DockerfileGenerator:
         if "boost" in text:
             packages.append("libboost-all-dev")
 
-        # 图形 / OpenGL
-        if "x11" in text or "xrandr" in text or "xrender" in text or "xcb" in text or "wayland" in text:
+        # 图形 / OpenGL：使用词边界匹配，避免误匹配
+        if re.search(r"\bx11\b", text) or re.search(r"\bxrandr\b", text) or re.search(r"\bxrender\b", text) or re.search(r"\bxcb\b", text) or re.search(r"\bwayland\b", text):
             packages.extend(
                 [
                     "libx11-dev",
@@ -1787,10 +1843,9 @@ class DockerfileGenerator:
                     "libxkbcommon-x11-dev",
                     "libxinerama-dev",
                     "libwayland-dev",
-                    "xorg-dev",
                 ]
             )
-        if "opengl" in text or "glfw" in text or "glew" in text or "glu" in text:
+        if re.search(r"\bopengl\b", text) or re.search(r"\bglfw\b", text) or re.search(r"\bglew\b", text) or re.search(r"\bglu\b", text):
             packages.extend(["libgl1-mesa-dev", "libglu1-mesa-dev", "libglew-dev", "libglfw3-dev"])
 
         # 音频：收紧，不再用泛化的 "audio" / "video" 直接拉一大堆包

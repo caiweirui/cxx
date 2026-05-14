@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from cxxcrafter.agents.coordinator import CXXCrafterCoordinator
+from cxxcrafter.utils.batch_metrics import BatchMetricsCollector, format_summary_text, save_summary_json
 
 @dataclass
 class BatchItemResult:
@@ -257,6 +258,71 @@ class BatchExecutor:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
+        # ---- 计算详细指标 ----
+        metrics_collector = BatchMetricsCollector()
+        rag_hit_total = 0
+        for item in items:
+            raw = item.raw or {}
+            # 从 summary 中提取项目级指标
+            project_metric_data = {
+                "project_name": item.project_name,
+                "success": item.success,
+                "build_time_sec": item.duration_seconds,
+                "repair_rounds": self._to_int_safe(raw.get("repair_round", 0)),
+                "skipped": item.overall_status in ("skipped", "generated"),
+                "timeout": item.overall_status == "timeout",
+            }
+
+            # 提取 token 用量
+            agent_usage = raw.get("agent_usage") or raw.get("llm_usage") or {}
+            total_prompt = 0
+            total_completion = 0
+            total_tok = 0
+            if isinstance(agent_usage, dict):
+                for _agent_name, agent_info in agent_usage.items():
+                    if isinstance(agent_info, dict):
+                        usage = agent_info.get("usage") or {}
+                        total_prompt += self._to_int_safe(usage.get("prompt_tokens", 0))
+                        total_completion += self._to_int_safe(usage.get("completion_tokens", 0))
+                        total_tok += self._to_int_safe(usage.get("total_tokens", 0))
+            project_metric_data["prompt_tokens"] = total_prompt
+            project_metric_data["completion_tokens"] = total_completion
+            project_metric_data["total_tokens"] = total_tok
+
+            # 提取验证结果
+            ver_result = raw.get("verification_result") or {}
+            final_verdict = ver_result.get("final_verdict") or {}
+            stages = ver_result.get("stages") or {}
+
+            static_check = stages.get("consistency") or {}
+            product_check = stages.get("product") or {}
+            dynamic_check = stages.get("smoke") or stages.get("tests") or {}
+
+            project_metric_data["static_pass"] = bool(static_check.get("passed", False))
+            project_metric_data["product_pass"] = bool(product_check.get("passed", False))
+            project_metric_data["dynamic_pass"] = bool(dynamic_check.get("passed", False))
+            project_metric_data["final_verify_pass"] = bool(ver_result.get("success", False))
+
+            metrics_collector.add(project_metric_data)
+
+            # RAG 命中次数
+            rag_usage = raw.get("rag_usage") or raw.get("runtime_diagnostics") or {}
+            rag_hit_total += self._to_int_safe(rag_usage.get("hit_stage_count", 0))
+
+        metrics_summary = metrics_collector.summarize()
+
+        # 将指标写入 summary
+        summary["metrics"] = metrics_summary.to_dict()
+        summary["rag_hit_total"] = rag_hit_total
+
+        # 保存指标 JSON
+        metrics_json_path = str(Path(log_dir) / "batch_metrics.json")
+        try:
+            save_summary_json(metrics_summary, metrics_json_path)
+        except Exception:
+            pass
+
+        # ---- 打印详细指标报告 ----
         print("\n" + "=" * 58)
         print("批处理结束")
         print("=" * 58)
@@ -275,7 +341,27 @@ class BatchExecutor:
         if summary["stopped_early"]:
             print(f"停止原因: {summary['stop_reason']}")
         print(f"耗时   : {total_duration:.1f}s")
+        print("=" * 58)
+
+        # ---- 打印论文级指标 ----
+        print()
+        print("=" * 58)
+        print("📊 批量测试指标报告")
+        print("=" * 58)
+        print(f"构建成功率 (SR)        : {metrics_summary.sr:.2%}")
+        print(f"平均构建耗时 (T_avg)   : {metrics_summary.t_avg_sec:.2f} s")
+        print(f"平均修复轮次 (R_avg)   : {metrics_summary.r_avg:.2f}")
+        print(f"平均消耗 Token         : {metrics_summary.token_avg_m:.4f} M")
+        print(f"总消耗 Token           : {metrics_summary.token_total_m:.4f} M")
+        print(f"RAG 命中次数           : {rag_hit_total}")
+        print(f"静态一致性通过率       : {metrics_summary.static_pass_rate:.2%}")
+        print(f"产物测试通过率         : {metrics_summary.product_pass_rate:.2%}")
+        print(f"动态测试通过率         : {metrics_summary.dynamic_pass_rate:.2%}")
+        print(f"综合验证通过率         : {metrics_summary.final_verify_pass_rate:.2%}")
         print("=" * 58 + "\n")
+
+        # 将格式化文本也存入 summary，供 GUI 弹窗使用
+        summary["metrics_report_text"] = format_summary_text(metrics_summary, rag_hit_total=rag_hit_total)
 
         return summary
 
@@ -430,6 +516,15 @@ class BatchExecutor:
         if not status:
             status = str(item.overall_status or "").lower().strip()
         return status
+
+    @staticmethod
+    def _to_int_safe(v, default=0):
+        try:
+            if v is None:
+                return default
+            return int(v)
+        except Exception:
+            return default
 
     @staticmethod
     def _looks_like_docker_error(text: str) -> bool:

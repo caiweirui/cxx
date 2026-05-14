@@ -115,8 +115,8 @@ def _infer_project_family(snapshot: Dict[str, Any]) -> Tuple[str, List[str]]:
         "geany", "libadwaita", "gtk3", "gtk4",
     ]
     x11_keywords = [
-        "x11", "xcb", "xlib", "xext", "xrandr", "xcursor", "xi",
-        "xinerama", "xkbcommon", "wayland", "dbus", "org.freedesktop",
+        "x11", "xcb", "xlib", "xrandr", "xcursor", "xinerama",
+        "xkbcommon", "wayland", "org.freedesktop",
     ]
 
     # Media / Audio

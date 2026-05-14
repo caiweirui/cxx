@@ -126,8 +126,24 @@ def choose_best_build_root(project_path: str, dirs: List[str]) -> str:
     if not dirs:
         return "."
 
+    _BAD_TOKENS = (
+        "docs", "doc", "examples", "example", "tests", "test",
+        "thirdparty", "vendor", "external", "submodule", "deps",
+        "platform", "android", "ios", "demo", "template",
+        "bsp", "sndserv", "open-amp", "rpmsg", "board", "ports",
+        "tools", "scripts", "ci", "benchmark", "fuzz",
+    )
+
+    def _score_dir(rel_dir: str) -> tuple:
+        depth = _score_rel_dir(rel_dir)
+        bad_penalty = 0
+        low = rel_dir.replace("\\", "/").lower()
+        if any(x in low for x in _BAD_TOKENS):
+            bad_penalty = 100
+        return (bad_penalty, depth, len(rel_dir))
+
     rels = [_safe_relpath(d, project_path) for d in dirs]
-    rels.sort(key=_score_rel_dir)
+    rels.sort(key=_score_dir)
     return rels[0] if rels else "."
 
 def _has_top_level_marker(project_path: str, marker_names: List[str]) -> bool:

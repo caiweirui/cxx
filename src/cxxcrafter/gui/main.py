@@ -12,6 +12,9 @@ from io import StringIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any, Dict, Optional, Sequence
+# -*- coding: utf-8 -*-
+
+from tkinter import messagebox
 
 # =========================================================
 # 添加 src 到路径
@@ -34,6 +37,7 @@ from cxxcrafter.cli import (
 )
 from cxxcrafter.execution.batch_executor import BatchExecutor
 from cxxcrafter.runtime.os_compat import format_os_tip, open_path
+from cxxcrafter.utils.batch_metrics import format_summary_text, BatchMetricsCollector, save_summary_json
 
 AGENT_LABELS = [
     ("dependency", "Dependency Agent"),
@@ -685,6 +689,11 @@ class CXXCrafterGUI:
             consecutive_failures = 0
             consecutive_failures_peak = 0
 
+            # 指标收集器
+            metrics_collector = BatchMetricsCollector()
+            rag_hit_total = 0
+            all_summaries = []
+
             if repo_list:
                 repo_list_path = Path(repo_list)
                 if not repo_list_path.exists():
@@ -753,6 +762,41 @@ class CXXCrafterGUI:
                         f"✅ 完成: {Path(repo_path).name} | status={overall_status} | success={success}"
                     )
 
+                    # 收集项目指标
+                    all_summaries.append(summary)
+                    _pm = {
+                        "project_name": Path(repo_path).name,
+                        "success": success,
+                        "build_time_sec": 0,
+                        "repair_rounds": int((summary or {}).get("repair_round", 0) or 0),
+                        "skipped": overall_status in ("skipped", "generated"),
+                        "timeout": overall_status == "timeout",
+                    }
+                    # token 用量
+                    _au = (summary or {}).get("agent_usage") or (summary or {}).get("llm_usage") or {}
+                    _tp = _tc = _tt = 0
+                    if isinstance(_au, dict):
+                        for _an, _ai in _au.items():
+                            if isinstance(_ai, dict):
+                                _u = _ai.get("usage") or {}
+                                _tp += int(_u.get("prompt_tokens", 0) or 0)
+                                _tc += int(_u.get("completion_tokens", 0) or 0)
+                                _tt += int(_u.get("total_tokens", 0) or 0)
+                    _pm["prompt_tokens"] = _tp
+                    _pm["completion_tokens"] = _tc
+                    _pm["total_tokens"] = _tt
+                    # 验证结果
+                    _vr = (summary or {}).get("verification_result") or {}
+                    _st = _vr.get("stages") or {}
+                    _pm["static_pass"] = bool((_st.get("consistency") or {}).get("passed", False))
+                    _pm["product_pass"] = bool((_st.get("product") or {}).get("passed", False))
+                    _pm["dynamic_pass"] = bool((_st.get("smoke") or _st.get("tests") or {}).get("passed", False))
+                    _pm["final_verify_pass"] = bool(_vr.get("success", False))
+                    metrics_collector.add(_pm)
+                    # RAG 命中
+                    _ru = (summary or {}).get("rag_usage") or (summary or {}).get("runtime_diagnostics") or {}
+                    rag_hit_total += int(_ru.get("hit_stage_count", 0) or 0)
+
                     if stop_on_docker_error and _is_docker_unavailable_summary(summary):
                         self._append_line("🛑 检测到 Docker 异常，立即停止整个批处理。")
                         break
@@ -805,6 +849,38 @@ class CXXCrafterGUI:
                     f"✅ 完成: {Path(project_path).name} | status={overall_status} | success={success}"
                 )
 
+                # 单项目也收集指标
+                all_summaries.append(summary)
+                _pm = {
+                    "project_name": Path(project_path).name,
+                    "success": success,
+                    "build_time_sec": 0,
+                    "repair_rounds": int((summary or {}).get("repair_round", 0) or 0),
+                    "skipped": overall_status in ("skipped", "generated"),
+                    "timeout": overall_status == "timeout",
+                }
+                _au = (summary or {}).get("agent_usage") or (summary or {}).get("llm_usage") or {}
+                _tp = _tc = _tt = 0
+                if isinstance(_au, dict):
+                    for _an, _ai in _au.items():
+                        if isinstance(_ai, dict):
+                            _u = _ai.get("usage") or {}
+                            _tp += int(_u.get("prompt_tokens", 0) or 0)
+                            _tc += int(_u.get("completion_tokens", 0) or 0)
+                            _tt += int(_u.get("total_tokens", 0) or 0)
+                _pm["prompt_tokens"] = _tp
+                _pm["completion_tokens"] = _tc
+                _pm["total_tokens"] = _tt
+                _vr = (summary or {}).get("verification_result") or {}
+                _st = _vr.get("stages") or {}
+                _pm["static_pass"] = bool((_st.get("consistency") or {}).get("passed", False))
+                _pm["product_pass"] = bool((_st.get("product") or {}).get("passed", False))
+                _pm["dynamic_pass"] = bool((_st.get("smoke") or _st.get("tests") or {}).get("passed", False))
+                _pm["final_verify_pass"] = bool(_vr.get("success", False))
+                metrics_collector.add(_pm)
+                _ru = (summary or {}).get("rag_usage") or (summary or {}).get("runtime_diagnostics") or {}
+                rag_hit_total += int(_ru.get("hit_stage_count", 0) or 0)
+
             self._append_line("")
             self._append_line("==================================================")
             self._append_line(
@@ -838,7 +914,25 @@ class CXXCrafterGUI:
             def finish_ui():
                 self.status_var.set("完成")
                 self._set_running_ui(False)
-                if failure_count == 0:
+
+                # 计算并显示批量测试指标
+                metrics_text = ""
+                try:
+                    metrics_summary = metrics_collector.summarize()
+                    metrics_text = format_summary_text(metrics_summary, rag_hit_total=rag_hit_total)
+                    # 保存指标 JSON
+                    try:
+                        _mjp = Path(log_dir) / "batch_metrics.json"
+                        save_summary_json(metrics_summary, str(_mjp))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                if metrics_text and total > 1:
+                    # 批量模式：弹出指标报告
+                    messagebox.showinfo("📊 批量测试结果", metrics_text)
+                elif failure_count == 0:
                     messagebox.showinfo("完成", "任务执行完成。")
                 else:
                     messagebox.showwarning("完成", f"任务执行完成，但有 {failure_count} 个失败项。")
@@ -952,6 +1046,40 @@ class CXXCrafterGUI:
         except Exception:
             pass
         self.root.destroy()
+    
+    def run_batch_and_popup(coordinator, project_paths, output_dir):
+        collector = BatchMetricsCollector()
+        results = []
+
+        for p in project_paths:
+            try:
+                r = coordinator.process_project(p)
+                results.append(r)
+                collector.add(r)
+            except Exception as e:
+                fail_r = {
+                    "project_name": p,
+                    "success": False,
+                    "build_time_sec": 0.0,
+                    "repair_rounds": 0,
+                    "total_tokens": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "manual_intervention": True,
+                    "timeout": False,
+                    "skipped": False,
+                    "error": str(e),
+                }
+                results.append(fail_r)
+                collector.add(fail_r)
+
+        summary = collector.summarize()
+        save_summary_json(summary, f"{output_dir}/summary.json")
+
+        text = format_summary_text(summary, rag_hit_total=0)
+        messagebox.showinfo("📊 批量测试结果", text)
+
+        return summary, results
 
 # =========================================================
 # Headless 批处理入口
@@ -1068,6 +1196,8 @@ def run_headless(args: argparse.Namespace) -> Dict[str, Any]:
 
     return summary
 
+
+
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -1084,6 +1214,7 @@ def main():
     root = tk.Tk()
     app = CXXCrafterGUI(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()

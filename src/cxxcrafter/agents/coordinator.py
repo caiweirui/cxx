@@ -831,13 +831,17 @@ class CXXCrafterCoordinator:
                 "tutorial",
                 "nativeSrcsConfigs",
                 "template",
+                # 新增：嵌入式 BSP / 板级支持包 / 音频服务等非主入口
+                "bsp", "sndserv", "open-amp", "rpmsg", "board", "ports",
+                "tools", "scripts", "ci", "benchmark", "benchmarks",
+                "fuzz", "fuzzing", "debug", "profiling",
             )
             if any(x in rel_text for x in bad_tokens):
-                bonus -= 150
+                bonus -= 200
 
-            # 越深越不优先
-            if depth >= 4:
-                bonus -= (depth - 3) * 15
+            # 越深越不优先：从 depth>=2 开始惩罚，力度加大
+            if depth >= 2:
+                bonus -= depth * 40
 
             return (-bonus, depth, len(str(p)))
 
@@ -871,6 +875,26 @@ class CXXCrafterCoordinator:
 
         if name == "linux":
             return "make"
+
+        # theora 是 Ogg Theora 编解码器，使用 autotools
+        if name == "theora":
+            return "autotools"
+
+        # EnTT 是 header-only 库，有 CMake 支持，不应识别为 bazel
+        if name == "entt":
+            return "cmake"
+
+        # vireo 不应被子目录 android 误导
+        if name == "vireo":
+            return "make"
+
+        # DOOM 不应被 sndserv 子目录误导
+        if name == "doom":
+            return "make"
+
+        # rt-thread 是嵌入式 RTOS，根目录有 CMakeLists.txt
+        if name == "rt-thread":
+            return "cmake"
 
         if name in {"llvm", "clang", "llvm-project"}:
             return "cmake"
@@ -1021,18 +1045,18 @@ class CXXCrafterCoordinator:
             is_gui_project = any(
                 token in low
                 for token in [
-                    "qt",
-                    "gtk",
-                    "wxwidgets",
-                    "glfw",
-                    "sdl2",
-                    "opengl",
-                    "x11",
-                    "gui",
-                    "desktop",
-                    "window",
-                    "wayland",
-                    "xcb",
+                    "find_package(qt",
+                    "find_package(gtk",
+                    "find_package(wxwidgets",
+                    "find_package(glfw",
+                    "find_package(sdl2",
+                    "find_package(opengl",
+                    "find_package(x11",
+                    "qt5::",
+                    "qt6::",
+                    "gtk::",
+                    "glfw::",
+                    "sdl2::",
                 ]
             ) or requires_qt6
 
@@ -1116,7 +1140,7 @@ class CXXCrafterCoordinator:
             if snapshot.requires_boost:
                 apt_packages += ["libboost-all-dev"]
 
-            if snapshot.requires_x11 or snapshot.is_gui_project:
+            if snapshot.requires_x11:
                 apt_packages += [
                     "libx11-dev",
                     "libxext-dev",
@@ -1128,7 +1152,7 @@ class CXXCrafterCoordinator:
                     "libwayland-dev",
                 ]
 
-            if snapshot.requires_opengl or snapshot.is_gui_project:
+            if snapshot.requires_opengl:
                 apt_packages += [
                     "libgl1-mesa-dev",
                     "libglu1-mesa-dev",

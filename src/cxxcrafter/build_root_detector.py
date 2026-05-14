@@ -89,10 +89,22 @@ class BuildRootDetector:
         if any(name.endswith((".cpp", ".cc", ".c", ".h", ".hpp", ".hh")) for name in files):
             score += 1.0
 
-        # 6. 太深的目录适当降分
+        # 6. 太深的目录大幅降分，避免选到深层子目录
         rel = os.path.relpath(path, self.project_root)
         depth = 0 if rel == "." else rel.count(os.sep) + 1
-        score -= min(depth * 0.5, 3.0)
+        score -= min(depth * 2.0, 10.0)
+
+        # 7. 惩罚常见非主入口目录名
+        rel_text = rel.replace("\\", "/").lower()
+        bad_tokens = (
+            "docs", "doc", "examples", "example", "tests", "test",
+            "thirdparty", "vendor", "external", "submodule", "deps",
+            "platform", "android", "ios", "demo", "template",
+            "bsp", "sndserv", "open-amp", "rpmsg", "board", "ports",
+            "tools", "scripts", "ci", "benchmark", "fuzz",
+        )
+        if any(x in rel_text for x in bad_tokens):
+            score -= 8.0
 
         return score
 
